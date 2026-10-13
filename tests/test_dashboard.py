@@ -1473,6 +1473,86 @@ async def test_dashboard_session_detail_redacts_sensitive_display_records(trace_
 
 
 @pytest.mark.asyncio
+async def test_dashboard_records_do_not_crash_on_non_url_question_marks(trace_db) -> None:
+    """Edit old_string with a '//' comment and ternary '?' must not 500 /records.
+
+    CPython urlsplit treats a leading '//' as a network-path reference. A
+    fullwidth colon in that fake netloc raises ValueError under NFKC
+    normalization. Real URL query secrets must still be redacted.
+    """
+    old_string = "// 交付物：仅展示差异\nconst value = flag ? left : right;\n"
+    spaced_comment = "// note only\nconst value = flag ? token=keep-comment-secret : right;\n"
+    scheme_relative_colon = "//交付物：仅?token=keep-netloc-secret"
+    schemed_colon = "http://交付物：仅/path?token=keep-scheme-secret"
+    store = get_trace_store()
+    session_id = store.create_session(client="claude", proxy_mode="reverse")
+    store.append_record(
+        session_id,
+        {
+            "timestamp": "2026-05-20T10:00:00+00:00",
+            "request_id": "req_edit_comment",
+            "turn": 1,
+            "request": {
+                "method": "POST",
+                "path": "/v1/messages?access_token=path-secret",
+                "url": "https://oauth.example/callback?id_token=url-secret&state=ok",
+                "body": {
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": "draft"},
+                                {"type": "text", "text": scheme_relative_colon},
+                                {
+                                    "type": "tool_use",
+                                    "name": "Edit",
+                                    "input": {
+                                        "file_path": "trajectory-view.ts",
+                                        "old_string": old_string,
+                                        "new_string": spaced_comment,
+                                    },
+                                },
+                            ],
+                        }
+                    ]
+                },
+            },
+            "response": {
+                "status": 200,
+                "body": {"upstream": schemed_colon, "asset": "//cdn.example.com/asset?token=cdn-secret"},
+            },
+        },
+    )
+
+    server = LiveViewerServer(port=0, dashboard_mode=True)
+    port = await server.start()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{port}/api/sessions/{session_id}/records") as resp:
+                assert resp.status == 200
+                payload = await resp.json()
+                record = payload["records"][0]
+                content = record["request"]["body"]["messages"][0]["content"]
+                edit = content[2]["input"]
+                assert edit["old_string"] == old_string
+                assert edit["new_string"] == spaced_comment
+                assert content[1]["text"] == scheme_relative_colon
+                assert record["response"]["body"]["upstream"] == schemed_colon
+                assert "keep-comment-secret" in edit["new_string"]
+                assert "keep-netloc-secret" in content[1]["text"]
+                assert "keep-scheme-secret" in record["response"]["body"]["upstream"]
+                assert record["request"]["path"] == "/v1/messages?access_token=REDACTED"
+                assert record["request"]["url"] == "https://oauth.example/callback?id_token=REDACTED&state=ok"
+                assert record["response"]["body"]["asset"] == "//cdn.example.com/asset?token=REDACTED"
+                rendered = json.dumps(payload)
+                assert "path-secret" not in rendered
+                assert "url-secret" not in rendered
+                assert "cdn-secret" not in rendered
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_dashboard_session_html_uses_remote_records_for_long_codex_prompt(trace_db) -> None:
     store = get_trace_store()
     session_id = store.create_session(client="codexapp", proxy_mode="forward")

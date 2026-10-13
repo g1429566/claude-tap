@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep session records from returning HTTP 500 when tool source contains a `//` comment and a `?` that is not a URL. A fullwidth colon in that text no longer crashes query redaction.
 - Ignore object key order in viewer parameter diffs and sort displayed JSON to highlight actual value changes.
 
 - Preserve wrapped-client stdout for every mode by always routing claude-tap operational output to stderr.

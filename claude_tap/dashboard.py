@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from claude_tap.bedrock import bedrock_model_from_path
 from claude_tap.trace_encoding import (
@@ -60,6 +60,9 @@ _SENSITIVE_KEY_NAMES = {
 }
 _FORM_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-\[\]]{1,128}$")
 _MAX_TEXT_REDACTION_DEPTH = 8
+# urllib.parse.urlsplit lstrips C0 controls and space, then deletes tab/CR/LF.
+_LEADING_URL_STRIP = "".join(chr(code) for code in range(33))
+_URL_BYTES_REMOVED_BY_SPLIT = "\t\r\n"
 
 
 def read_dashboard_template() -> str:
@@ -952,11 +955,46 @@ def _redact_sensitive_text(value: str, depth: int = 0) -> str:
     return value if redacted_form is None else redacted_form
 
 
-def _redact_url_query(value: str, depth: int = 0) -> str | None:
-    if "?" not in value:
+def _urlsplit_or_none(value: str) -> SplitResult | None:
+    """Parse a URL, or return None when the candidate is not a URL.
+
+    CPython urlsplit raises ValueError when a netloc NFKC-normalizes to a
+    delimiter. A fullwidth colon in a '//' comment or a non-URL host is enough
+    to do that, and the records endpoint must keep serving the payload.
+    """
+    try:
+        return urlsplit(value)
+    except ValueError:
         return None
-    parsed = urlsplit(value)
-    if not parsed.query or not _looks_like_url_or_path(value, parsed.path):
+
+
+def _scheme_relative_authority_has_whitespace(value: str) -> bool:
+    """Return whether a leading '//' is source text rather than a URL host.
+
+    urlsplit treats a leading '//' as a network-path reference. Tool source
+    that starts with a '//' comment and later contains '?' is not a
+    scheme-relative URL when that authority still contains whitespace after
+    the same tab/CR/LF removal urlsplit applies.
+    """
+    stripped = value.lstrip(_LEADING_URL_STRIP)
+    if not stripped.startswith("//"):
+        return False
+    rest = stripped[2:]
+    for byte in _URL_BYTES_REMOVED_BY_SPLIT:
+        rest = rest.replace(byte, "")
+    authority_end = len(rest)
+    for index, char in enumerate(rest):
+        if char in "/?#":
+            authority_end = index
+            break
+    return any(char.isspace() for char in rest[:authority_end])
+
+
+def _redact_url_query(value: str, depth: int = 0) -> str | None:
+    if "?" not in value or _scheme_relative_authority_has_whitespace(value):
+        return None
+    parsed = _urlsplit_or_none(value)
+    if parsed is None or not parsed.query or not _looks_like_url_or_path(value, parsed):
         return None
     redacted_query = _redact_query_string(parsed.query, depth)
     if redacted_query is None:
@@ -998,8 +1036,8 @@ def _redact_query_string(query: str, depth: int = 0) -> str | None:
     return urlencode(redacted_pairs)
 
 
-def _looks_like_url_or_path(value: str, path: str) -> bool:
-    parsed = urlsplit(value)
+def _looks_like_url_or_path(value: str, parsed: SplitResult) -> bool:
+    path = parsed.path
     return bool(parsed.scheme or parsed.netloc or value.startswith(("/", "?")) or ("/" in path and "=" not in path))
 
 
