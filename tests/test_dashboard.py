@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import aiohttp
 import pytest
@@ -31,6 +32,7 @@ from claude_tap.dashboard import (
     list_trace_sessions,
     load_trace_session,
     read_dashboard_template,
+    redact_dashboard_records,
 )
 from claude_tap.history import migrate_legacy_traces
 from claude_tap.live import LiveViewerServer, _record_limit_from_request
@@ -1392,6 +1394,174 @@ async def test_dashboard_export_html_normalizes_bedrock_eventstream(trace_db) ->
     assert '"sse_events":' in html
     assert '"content":[{"type":"text","text":"OK"}]' in html
     assert "binary-prefix" not in html
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "// Deliverables\uff1a only\nconst result = ready ? left : right;",
+        "// Comment\uff0f details\nconst result = ready ? left : right;",
+        "// Comment\uff03 details\nconst result = ready ? left : right;",
+        "// Comment\uff20 details\nconst result = ready ? left : right;",
+        "// Comment\uff1f details\nconst result = ready ? left : right;",
+        "// [note]\nconst result = ready ? left : right;",
+        "// [unfinished\nconst result = ready ? left : right;",
+    ],
+    ids=["nfkc-colon", "nfkc-slash", "nfkc-hash", "nfkc-at", "nfkc-question", "invalid-ipv6", "unmatched-bracket"],
+)
+def test_dashboard_redaction_preserves_text_with_invalid_url_authority(text: str) -> None:
+    records = [{"old_string": text, "access_token": "display-secret"}]
+
+    assert redact_dashboard_records(records) == [{"old_string": text, "access_token": "REDACTED"}]
+    assert records == [{"old_string": text, "access_token": "display-secret"}]
+
+
+def test_dashboard_redaction_preserves_code_in_json_text() -> None:
+    text = "// Deliverables\uff1a only\nconst result = ready ? left : right;"
+    body = json.dumps({"old_string": text, "access_token": "json-secret"})
+
+    redacted = redact_dashboard_records([{"request": {"body": body}}])
+
+    assert json.loads(redacted[0]["request"]["body"]) == {"old_string": text, "access_token": "REDACTED"}
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("HTTPS://example.com/callback?access_token=secret#", "HTTPS://example.com/callback?access_token=REDACTED#"),
+        ("//example.com/callback?token=secret", "//example.com/callback?token=REDACTED"),
+        ("//[::1]/callback?token=secret", "//[::1]/callback?token=REDACTED"),
+        ("//\u4ea4\u4ed8\u7269/callback?token=secret", "//\u4ea4\u4ed8\u7269/callback?token=REDACTED"),
+        ("/oauth/callback?token=secret", "/oauth/callback?token=REDACTED"),
+        ("oauth/callback?token=secret", "oauth/callback?token=REDACTED"),
+        ("../callback?token=secret", "../callback?token=REDACTED"),
+        ("?api_key=secret&state=ok", "?api_key=REDACTED&state=ok"),
+        ("///callback?token=secret", "///callback?token=REDACTED"),
+        ("//?token=secret", "//?token=REDACTED"),
+        ("/directory with spaces/callback?token=secret", "/directory with spaces/callback?token=REDACTED"),
+        ("// api host/callback?token=secret", "// api host/callback?token=REDACTED"),
+        ("//api.\nexample.com/callback?token=secret", "//api.\nexample.com/callback?token=REDACTED"),
+        (
+            "\x00\x1fht\ttps://example.com/callback?token=secret",
+            "\x00\x1fht\ttps://example.com/callback?token=REDACTED",
+        ),
+        ("https://example.com\uff1a443/callback?token=secret", "https://example.com\uff1a443/callback?token=REDACTED"),
+        ("//example.com\uff1a443/callback?token=secret", "//example.com\uff1a443/callback?token=REDACTED"),
+        ("//[unfinished/callback?token=secret", "//[unfinished/callback?token=REDACTED"),
+        ("https://[note]/callback?token=secret", "https://[note]/callback?token=REDACTED"),
+        ("/callback?token=secret#fragment?token=public", "/callback?token=REDACTED#fragment?token=public"),
+        ("/callback?token=&token=secret&flag", "/callback?token=&token=REDACTED&flag="),
+        ("/callback?access%5Ftoken=secret", "/callback?access_token=REDACTED"),
+    ],
+    ids=[
+        "scheme-case-empty-fragment",
+        "network-path",
+        "ipv6-host",
+        "unicode-host",
+        "root-relative",
+        "relative-path",
+        "parent-relative",
+        "query-only",
+        "extra-leading-slash",
+        "empty-authority",
+        "path-spaces",
+        "authority-spaces",
+        "authority-newline",
+        "leading-controls-scheme-tab",
+        "nfkc-absolute-authority",
+        "nfkc-network-authority",
+        "unmatched-bracket-authority",
+        "invalid-ipv6-authority",
+        "query-before-fragment",
+        "empty-repeated-token-and-flag",
+        "encoded-sensitive-key",
+    ],
+)
+def test_dashboard_redacts_query_without_normalizing_url_prefix(value: str, expected: str) -> None:
+    records = [{"url": value}]
+
+    assert redact_dashboard_records(records) == [{"url": expected}]
+    assert records == [{"url": value}]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "// Deliverables\uff1a only\nconst result = ready ? left : token;",
+        "// Deliverables\uff1a only\nconst result = obj?.token;",
+        "https://example.com/callback#fragment?token=public",
+        "callback?token=public",
+        "?token",
+        "?token=",
+    ],
+    ids=[
+        "ternary-token-branch",
+        "optional-token-property",
+        "fragment-question",
+        "bare-filename",
+        "flag",
+        "empty-token",
+    ],
+)
+def test_dashboard_redaction_preserves_text_without_sensitive_query_values(value: str) -> None:
+    assert redact_dashboard_records([{"text": value}]) == [{"text": value}]
+
+
+def test_dashboard_redacts_nested_query_with_invalid_url_authority() -> None:
+    body = (
+        "client_secret=form-secret&redirect_uri=%2F%2Fexample.com%EF%BC%9A443%2Fcallback%3Faccess_token%3Dnested-secret"
+    )
+
+    redacted = redact_dashboard_records([{"body": body}])[0]["body"]
+
+    assert parse_qs(redacted) == {
+        "client_secret": ["REDACTED"],
+        "redirect_uri": ["//example.com\uff1a443/callback?access_token=REDACTED"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_dashboard_session_records_preserve_edit_code_with_nfkc_punctuation(trace_db) -> None:
+    old_string = "// Deliverables\uff1a only\nconst result = ready ? left : right;"
+    store = get_trace_store()
+    session_id = store.create_session(client="claude", proxy_mode="reverse")
+    record = _anthropic_record()
+    record["request"]["url"] = "https://api.anthropic.com/v1/messages?access_token=url-secret&client_id=public"
+    record["request"]["headers"]["Authorization"] = "Bearer header-secret"
+    record["request"]["body"]["messages"].append(
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "tool_edit",
+                    "name": "Edit",
+                    "input": {
+                        "file_path": "example.ts",
+                        "old_string": old_string,
+                        "new_string": "const result = left;",
+                    },
+                }
+            ],
+        }
+    )
+    store.append_record(session_id, record)
+
+    server = LiveViewerServer(port=0, dashboard_mode=True)
+    port = await server.start()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{port}/api/sessions/{session_id}/records") as resp:
+                assert resp.status == 200
+                payload = await resp.json()
+    finally:
+        await server.stop()
+
+    displayed = payload["records"][0]["request"]
+    assert displayed["body"]["messages"][1]["content"][0]["input"]["old_string"] == old_string
+    assert displayed["url"] == "https://api.anthropic.com/v1/messages?access_token=REDACTED&client_id=public"
+    assert displayed["headers"]["Authorization"] == "REDACTED"
+    assert store.load_records(session_id) == [record]
 
 
 @pytest.mark.asyncio

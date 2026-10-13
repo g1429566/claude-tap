@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Redact URL queries without parsing their authority, preserving code snippets and malformed URL prefixes instead of returning HTTP 500.
+
 - Ignore object key order in viewer parameter diffs and sort displayed JSON to highlight actual value changes.
 
 - Preserve wrapped-client stdout for every mode by always routing claude-tap operational output to stderr.

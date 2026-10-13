@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 from claude_tap.bedrock import bedrock_model_from_path
 from claude_tap.trace_encoding import (
@@ -59,6 +59,8 @@ _SENSITIVE_KEY_NAMES = {
     "xapikey",
 }
 _FORM_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-\[\]]{1,128}$")
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+_URL_LEADING_C0_OR_SPACE = "".join(chr(codepoint) for codepoint in range(33))
 _MAX_TEXT_REDACTION_DEPTH = 8
 
 
@@ -953,15 +955,15 @@ def _redact_sensitive_text(value: str, depth: int = 0) -> str:
 
 
 def _redact_url_query(value: str, depth: int = 0) -> str | None:
-    if "?" not in value:
+    before_fragment, fragment_separator, fragment = value.partition("#")
+    prefix, query_separator, query = before_fragment.partition("?")
+    if not query_separator or not query or not _looks_like_url_or_path(prefix):
         return None
-    parsed = urlsplit(value)
-    if not parsed.query or not _looks_like_url_or_path(value, parsed.path):
-        return None
-    redacted_query = _redact_query_string(parsed.query, depth)
+    # Query redaction does not need to parse or validate an arbitrary authority.
+    redacted_query = _redact_query_string(query, depth)
     if redacted_query is None:
         return None
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, redacted_query, parsed.fragment))
+    return f"{prefix}?{redacted_query}{fragment_separator}{fragment}"
 
 
 def _redact_form_text(value: str, depth: int = 0) -> str | None:
@@ -989,7 +991,9 @@ def _redact_query_string(query: str, depth: int = 0) -> str | None:
     redacted_pairs = [
         (
             item_key,
-            _REDACTED_VALUE if _is_sensitive_key(item_key) else _redact_nested_sensitive_text(item_value, depth),
+            _REDACTED_VALUE
+            if item_value and _is_sensitive_key(item_key)
+            else _redact_nested_sensitive_text(item_value, depth),
         )
         for item_key, item_value in pairs
     ]
@@ -998,9 +1002,15 @@ def _redact_query_string(query: str, depth: int = 0) -> str | None:
     return urlencode(redacted_pairs)
 
 
-def _looks_like_url_or_path(value: str, path: str) -> bool:
-    parsed = urlsplit(value)
-    return bool(parsed.scheme or parsed.netloc or value.startswith(("/", "?")) or ("/" in path and "=" not in path))
+def _looks_like_url_or_path(prefix: str) -> bool:
+    # Match the parser's candidate cleanup without changing the original text.
+    candidate = prefix.lstrip(_URL_LEADING_C0_OR_SPACE).replace("\t", "").replace("\r", "").replace("\n", "")
+    return bool(
+        not candidate
+        or _URL_SCHEME_RE.match(candidate)
+        or candidate.startswith("/")
+        or ("/" in candidate and "=" not in candidate)
+    )
 
 
 def _looks_like_form_key(key: str) -> bool:
