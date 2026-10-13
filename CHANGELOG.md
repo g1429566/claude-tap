@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Redact URL queries without parsing their authority, preserving code snippets and malformed URL prefixes instead of returning HTTP 500.
+- Retain raw TAB/CR/LF cleanup in URL queries so nested form credentials remain redacted.
 
 - Ignore object key order in viewer parameter diffs and sort displayed JSON to highlight actual value changes.
 

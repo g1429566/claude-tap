@@ -960,6 +960,8 @@ def _redact_url_query(value: str, depth: int = 0) -> str | None:
     if not query_separator or not query or not _looks_like_url_or_path(prefix):
         return None
     # Query redaction does not need to parse or validate an arbitrary authority.
+    # Retain URL query cleanup so raw controls cannot hide nested credential keys.
+    query = query.replace("\t", "").replace("\r", "").replace("\n", "")
     redacted_query = _redact_query_string(query, depth)
     if redacted_query is None:
         return None

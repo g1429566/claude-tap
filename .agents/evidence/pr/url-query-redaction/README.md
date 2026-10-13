@@ -6,15 +6,13 @@ Claude Code request proxied to the locally configured DeepSeek backend on
 tokens and 59 output tokens. The prompt and response contain a comment starting
 with `//`, a full-width colon (U+FF1A), and a ternary expression using `?`.
 
-The prompt was written specifically for this regression check. No company
-trace, project files, credentials or personal prompts are included. The request
-used a minimal system prompt and disabled tools. This is a real backend request,
-not capture-only mode or a simulated API response.
+The prompt was written specifically for this regression check. The request
+used a minimal system prompt and disabled tools. The nested Edit `old_string`
+payload is separately covered by the local HTTP regression test.
 
-An independent server ran the complete unmodified upstream commit
-`e17ed32a16389e8fb3f4f510adc359c48e09211c` against a SQLite backup of that same
-real session. Actual HTTP requests to its session records and HTML viewer
-endpoints returned 500, with a server traceback ending in the NFKC `ValueError`
+Before/after checks used separate servers and a SQLite backup of the same
+captured session. Before the fix, session records and HTML viewer requests
+returned 500, with a server traceback ending in the NFKC `ValueError`
 from CPython's `_checknetloc()`. The original DeepSeek model response was 200;
 the failures occurred in claude-tap's viewer endpoints.
 
@@ -22,10 +20,10 @@ With this fix, the original prompt is preserved and the browser's request to
 `/api/sessions/{session_id}/records?offset=0&limit=1` returns HTTP 200. The actual
 HTML viewer also returns HTTP 200.
 
-The final implementation removes `urlsplit()` and `urlunsplit()` from query
-redaction. The screenshot was refreshed after restarting the fixed server with
-that implementation. The captured model request was reused unchanged; no
-additional model invocation was needed for the before/after comparison.
+Query redaction extracts the query directly, without authority parsing. The
+captured model request was reused unchanged for the before/after comparison.
+The follow-up control-character cleanup is covered by regression tests and
+does not change the captured code snippet or the pictured viewer content.
 
 Raw request/response records are intentionally excluded from this contribution.
 

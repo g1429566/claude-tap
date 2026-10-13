@@ -1520,6 +1520,56 @@ def test_dashboard_redacts_nested_query_with_invalid_url_authority() -> None:
     }
 
 
+@pytest.mark.parametrize("control", ["\t", "\r", "\n"], ids=["tab", "cr", "lf"])
+@pytest.mark.parametrize(
+    "prefix",
+    ["https://host/path", "//host/path", "/path", "relative/path", ""],
+    ids=["absolute", "network-path", "root-relative", "relative-path", "query-only"],
+)
+def test_dashboard_redacts_nested_form_keys_with_raw_url_controls(prefix: str, control: str) -> None:
+    value = f"{prefix}?payload=client_se{control}cret=example-secret#keep"
+    records = [{"url": value}]
+
+    assert redact_dashboard_records(records) == [{"url": f"{prefix}?payload=client_secret%3DREDACTED#keep"}]
+    assert records == [{"url": value}]
+
+
+@pytest.mark.parametrize("control", ["\t", "\r", "\n"], ids=["tab", "cr", "lf"])
+def test_dashboard_redacts_raw_control_in_form_nested_inside_query_url(control: str) -> None:
+    value = f"https://host/path?payload=https://nested/path?payload=client_se{control}cret=example-secret"
+
+    redacted = redact_dashboard_records([{"url": value}])[0]["url"]
+
+    assert parse_qs(redacted.partition("?")[2]) == {
+        "payload": ["https://nested/path?payload=client_secret%3DREDACTED"],
+    }
+
+
+@pytest.mark.parametrize("control", ["\t", "\r", "\n"], ids=["tab", "cr", "lf"])
+def test_dashboard_redacts_raw_query_controls_without_changing_prefix_or_fragment(control: str) -> None:
+    prefix = f"https://ho{control}st/path"
+    fragment = f"keep{control}fragment"
+    value = f"{prefix}?client_se{control}cret=example-secret#{fragment}"
+
+    assert redact_dashboard_records([{"url": value}]) == [{"url": f"{prefix}?client_secret=REDACTED#{fragment}"}]
+
+
+@pytest.mark.parametrize("encoded_control", ["%09", "%0D", "%0A"], ids=["tab", "cr", "lf"])
+def test_dashboard_preserves_encoded_query_controls_in_non_sensitive_values(encoded_control: str) -> None:
+    value = f"https://host/path?token=example-secret&label=left{encoded_control}right"
+
+    assert redact_dashboard_records([{"url": value}]) == [
+        {"url": f"https://host/path?token=REDACTED&label=left{encoded_control}right"},
+    ]
+
+
+@pytest.mark.parametrize("control", ["\t", "\r", "\n"], ids=["tab", "cr", "lf"])
+def test_dashboard_preserves_raw_query_controls_when_no_values_are_redacted(control: str) -> None:
+    text = f"// Deliverables\uff1a only\nconst result = ready ? left{control} : token;"
+
+    assert redact_dashboard_records([{"old_string": text}]) == [{"old_string": text}]
+
+
 @pytest.mark.asyncio
 async def test_dashboard_session_records_preserve_edit_code_with_nfkc_punctuation(trace_db) -> None:
     old_string = "// Deliverables\uff1a only\nconst result = ready ? left : right;"
