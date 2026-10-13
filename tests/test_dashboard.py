@@ -1868,6 +1868,54 @@ def test_dashboard_keeps_standalone_uri_and_form_redaction_in_source_fields(valu
     assert redact_dashboard_records([{"old_string": value}]) == [{"old_string": expected}]
 
 
+@pytest.mark.parametrize("prefix", ["https://host/path", "//host/path", "/path", "relative/path", ""])
+@pytest.mark.parametrize("suffix", ["\n", "\r\n", "\t", " ", "\u00a0", "\u3000"])
+@pytest.mark.parametrize("fragment", ["", "#keep"], ids=["query", "fragment"])
+def test_dashboard_redacts_standalone_uri_with_trailing_whitespace(prefix: str, suffix: str, fragment: str) -> None:
+    value = f"{prefix}?access_token=example-secret{fragment}{suffix}"
+    expected = f"{prefix}?access_token=REDACTED{fragment}{suffix}"
+    fields = {key: value for key in ("text", "content", "old_string")}
+
+    assert redact_dashboard_records([fields]) == [{key: expected for key in fields}]
+    assert fields == {key: value for key in fields}
+
+
+@pytest.mark.parametrize(
+    "leading", ["\n\t ", "\u00a0", "\u3000", "\x00\x1f", "\u00a0\x00 ", "\u3000\x00\t", "\u00a0\x1b\n"]
+)
+def test_dashboard_retains_surrounding_uri_whitespace(leading: str) -> None:
+    value = f"{leading}https://host/path?token=example-secret\r\n"
+    expected = f"{leading}https://host/path?token=REDACTED\r\n"
+
+    assert redact_dashboard_records([{"text": value}]) == [{"text": expected}]
+    nested = "https://outer/path?payload=" + json.dumps({"content": value}, separators=(",", ":"))
+    redacted = redact_dashboard_records([{"url": nested}])[0]["url"]
+    assert json.loads(parse_qs(redacted.partition("?")[2])["payload"][0]) == {"content": expected}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://host/path?token=example-secret\n#keep",
+        "/allowed/.test(value)?token===expected:fallback\nconsole.log(result)\n",
+        "//note?token===expected:fallback\nconsole.log(result)\r\n",
+        "/allowed/.test(value)?\ntoken===expected:fallback\n",
+    ],
+)
+def test_dashboard_trims_only_surrounding_whitespace_for_uri_inference(value: str) -> None:
+    assert redact_dashboard_records([{"old_string": value}]) == [{"old_string": value}]
+
+
+@pytest.mark.parametrize("label", ["left%0Aright", "\ud800"])
+def test_dashboard_redacts_surrounded_uri_with_encoded_whitespace_or_surrogate(label: str) -> None:
+    value = f"https://host/path?label={label}&token=example-secret\n"
+    expected_label = "%ED%A0%80" if label == "\ud800" else label
+
+    assert redact_dashboard_records([{"content": value}]) == [
+        {"content": f"https://host/path?label={expected_label}&token=REDACTED\n"}
+    ]
+
+
 @pytest.mark.parametrize(
     "old_string",
     [
@@ -1963,6 +2011,37 @@ async def test_dashboard_session_views_preserve_source_comparisons(trace_db) -> 
     metadata = json.loads(metadata_json.replace("<\\/", "</"))[0]
     assert metadata["session_user_text"] == text
     assert metadata["sys_hint"] == text
+    assert store.load_records(session_id) == [record]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_session_views_redact_uri_with_trailing_newline(trace_db) -> None:
+    uri = "https://host/path?access_token=example-secret\n"
+    store = get_trace_store()
+    session_id = store.create_session(client="claude", proxy_mode="reverse")
+    record = _anthropic_record()
+    record["request"]["body"]["messages"][0]["content"] = uri
+    record["request"]["body"]["system"] = uri
+    store.append_record(session_id, record)
+
+    server = LiveViewerServer(port=0, dashboard_mode=True)
+    port = await server.start()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{port}/api/sessions/{session_id}/records") as resp:
+                assert resp.status == 200
+                payload = await resp.json()
+            async with session.get(f"http://127.0.0.1:{port}/api/sessions/{session_id}/html") as resp:
+                assert resp.status == 200
+                html = await resp.text()
+    finally:
+        await server.stop()
+
+    displayed = payload["records"][0]["request"]["body"]
+    assert displayed["messages"][0]["content"] == "https://host/path?access_token=REDACTED\n"
+    assert displayed["system"] == "https://host/path?access_token=REDACTED\n"
+    assert "example-secret" not in html
+    assert "access_token=REDACTED" in html
     assert store.load_records(session_id) == [record]
 
 

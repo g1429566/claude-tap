@@ -1,49 +1,55 @@
 # URL query redaction regression evidence
 
-`trace-viewer-deepseek-flash.png` shows the actual session viewer for one real
-Claude Code request proxied to the locally configured DeepSeek backend on
-2026-10-13. The response returned HTTP 200, model `deepseek-flash`, 92 input
-tokens and 59 output tokens. The prompt and response contain a comment starting
-with `//`, a full-width colon (U+FF1A), and a ternary expression using `?`.
+These original browser screenshots use one complete two-user-turn Claude Code
+conversation captured through the local claude-tap proxy on 2026-10-14
+(Asia/Shanghai). The capture used the documented tmux interactive flow,
+without `-p` or `--print`, and the configured DeepSeek Anthropic backend with
+model `deepseek-flash`.
 
-The prompt was written specifically for this regression check. The request
-used a minimal system prompt and disabled tools. The nested Edit `old_string`
-payload is separately covered by the local HTTP regression test.
+The first prompt starts with the regression snippet, then asks Claude Code to
+read `sample.js`. The second prompt requests an Edit using the complete snippet
+as `old_string`, including its trailing newline. Real tool calls were
+Read, Edit and Read; the edit changed only the comment from `only` to `verified`.
+Both user turns completed successfully.
 
-Before/after checks used separate servers and a SQLite backup of the same
-captured session. Before the fix, session records and HTML viewer requests
-returned 500, with a server traceback ending in the NFKC `ValueError`
-from CPython's `_checknetloc()`. The original DeepSeek model response was 200;
-the failures occurred in claude-tap's viewer endpoints.
+The session contains six real `/v1/messages?beta=true` requests, all HTTP 200,
+including Claude Code's session-title request. Their combined usage is 2,379
+input tokens, 438 output tokens and 3,456 cache-read tokens. The viewer's
+2,817 cumulative API-token total counts input plus output; its six entries
+represent recorded API requests, rather than six user turns.
 
-With this fix, the original prompt is preserved and the browser's request to
-`/api/sessions/{session_id}/records?offset=0&limit=1` returns HTTP 200. The actual
-HTML viewer also returns HTTP 200.
+The actual Edit `old_string` is:
 
-Query redaction extracts the query directly, without authority parsing. The
-captured model request was reused unchanged for the before/after comparison.
-Regression tests also cover standalone URI inference, named URI fields, nested
-query/form credentials, control characters, lone surrogates and JSON handling.
-These checks do not change the captured snippet or the pictured viewer content.
+```javascript
+// Deliverables： only
+const result = ready ? token === expected : fallback;
+```
 
-Raw request/response records are intentionally excluded from this contribution.
+A trailing newline follows the second line. The prompts and isolated sample
+file were written for this regression check.
 
-## Original failure screenshot
+Before/after HTTP checks used separate servers and SQLite backups containing
+the same six captured records. The records and HTML viewer endpoints both
+return HTTP 500 before the fix, with the server traceback containing an NFKC
+`ValueError` from CPython's `_checknetloc()`. Both endpoints return HTTP 200
+after the fix; the actual Edit strings and captured prompt are preserved.
+The original model responses are HTTP 200 throughout.
 
-`trace-viewer-baseline-500.jpg` directly captures the original server's native
-HTTP 500 page in an isolated Chromium window, including the real Network Headers
-panel showing the request URL, GET method and status 500. The native screenshot
-tool returns JPEG bytes; the file retains those bytes unchanged with the correct
-`.jpg` extension. No conversion or image editing was performed. The fixed viewer
-screenshot directly captures the rendered session. Neither screenshot uses a
-comparison layout, compositing or simulated response. Both use the same real
-captured record and were visually checked for private content.
+- `trace-viewer-multiturn-fixed.jpg` is the primary trace evidence. It directly
+  captures the actual fixed viewer,
+  selecting the Edit-producing record and expanding its escaped input strings.
+  The sidebar shows all six requests and the header shows nonzero token usage.
+- `trace-viewer-multiturn-baseline-500.jpg` is supplementary failure evidence.
+  It directly captures the records endpoint's native HTTP 500 response page
+  for the same multi-turn session.
 
-Actual GET requests verified both original endpoints returned 500 and both fixed
-endpoints returned 200. The two SQLite databases contain the identical captured
-record.
+Both images retain the JPEG bytes returned by the browser screenshot API.
+No image editing or compositing was performed. The baseline error page is the
+intentional reproduced failure state, paired with the working viewer.
+Both images were visually inspected; the screenshot checker reported no
+failures, with warnings that JPEG blankness analysis is unsupported.
 
-Both screenshots pass the screenshot checker. Its JPEG blankness check is not
-implemented, so the native JPEG was also inspected visually and sampled without
-modification: the dominant color occupies 72.4% of the sampled pixels, below the
-PNG checker's 90% blankness threshold.
+Regression tests additionally cover URI context, surrounding and internal
+whitespace, nested credentials, control characters, JSON and lone surrogates.
+Raw trace exports, database files, logs and credentials are excluded from this
+contribution.

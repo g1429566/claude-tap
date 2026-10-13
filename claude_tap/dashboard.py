@@ -954,7 +954,10 @@ def _redact_sensitive_text(value: str, depth: int = 0, *, url_context: bool = Fa
 
 
 def _redact_url_query(value: str, depth: int = 0, *, url_context: bool = False) -> str | None:
-    before_fragment, fragment_separator, fragment = value.partition("#")
+    # Surrounding whitespace does not change a standalone URI's meaning.
+    url_text = value if url_context else value.rstrip()
+    trailing_whitespace = value[len(url_text) :]
+    before_fragment, fragment_separator, fragment = url_text.partition("#")
     prefix, query_separator, query = before_fragment.partition("?")
     if not query_separator or not query or not _looks_like_url_or_path(prefix):
         return None
@@ -962,7 +965,7 @@ def _redact_url_query(value: str, depth: int = 0, *, url_context: bool = False) 
     # Infer a URL only from a standalone token, not whitespace-separated source.
     # Named URI fields and decoded query/form values retain permissive redaction.
     if not url_context and (
-        any(char.isspace() for char in prefix.lstrip(_URL_LEADING_C0_OR_SPACE)) or any(char.isspace() for char in query)
+        any(char.isspace() for char in re.sub(r"^[\x00-\x20\s]+", "", prefix)) or any(char.isspace() for char in query)
     ):
         return None
     # Check inference before cleanup so removing newlines cannot turn source into a URL.
@@ -971,7 +974,7 @@ def _redact_url_query(value: str, depth: int = 0, *, url_context: bool = False) 
     redacted_query = _redact_query_string(query, depth)
     if redacted_query is None:
         return None
-    return f"{prefix}?{redacted_query}{fragment_separator}{fragment}"
+    return f"{prefix}?{redacted_query}{fragment_separator}{fragment}{trailing_whitespace}"
 
 
 def _redact_form_text(value: str, depth: int = 0) -> str | None:
