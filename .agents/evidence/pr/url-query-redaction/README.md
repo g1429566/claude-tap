@@ -22,8 +22,9 @@ HTML viewer also returns HTTP 200.
 
 Query redaction extracts the query directly, without authority parsing. The
 captured model request was reused unchanged for the before/after comparison.
-The follow-up control-character cleanup is covered by regression tests and
-does not change the captured code snippet or the pictured viewer content.
+Regression tests also cover standalone URI inference, named URI fields, nested
+query/form credentials, control characters, lone surrogates and JSON handling.
+These checks do not change the captured snippet or the pictured viewer content.
 
 Raw request/response records are intentionally excluded from this contribution.
 

@@ -928,13 +928,13 @@ def _redact_sensitive_value(value: Any, key: str = "") -> Any:
             str(item_key): _redact_sensitive_value(item_value, str(item_key)) for item_key, item_value in value.items()
         }
     if isinstance(value, list):
-        return [_redact_sensitive_value(item) for item in value]
+        return [_redact_sensitive_value(item, key) for item in value]
     if isinstance(value, str):
-        return _redact_sensitive_text(value)
+        return _redact_sensitive_text(value, url_context=_is_url_or_path_key(key))
     return value
 
 
-def _redact_sensitive_text(value: str, depth: int = 0) -> str:
+def _redact_sensitive_text(value: str, depth: int = 0, *, url_context: bool = False) -> str:
     stripped = value.strip()
     if not stripped:
         return value
@@ -944,22 +944,28 @@ def _redact_sensitive_text(value: str, depth: int = 0) -> str:
         except json.JSONDecodeError:
             parsed = None
         if parsed is not None:
-            redacted = _redact_sensitive_value(parsed)
-            if redacted != parsed:
-                return json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
-    redacted_url = _redact_url_query(value, depth)
+            redacted = _redact_sensitive_value(parsed, "url" if url_context else "")
+            return value if redacted == parsed else json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
+    redacted_url = _redact_url_query(value, depth, url_context=url_context)
     if redacted_url is not None:
         return redacted_url
     redacted_form = _redact_form_text(value, depth)
     return value if redacted_form is None else redacted_form
 
 
-def _redact_url_query(value: str, depth: int = 0) -> str | None:
+def _redact_url_query(value: str, depth: int = 0, *, url_context: bool = False) -> str | None:
     before_fragment, fragment_separator, fragment = value.partition("#")
     prefix, query_separator, query = before_fragment.partition("?")
     if not query_separator or not query or not _looks_like_url_or_path(prefix):
         return None
     # Query redaction does not need to parse or validate an arbitrary authority.
+    # Infer a URL only from a standalone token, not whitespace-separated source.
+    # Named URI fields and decoded query/form values retain permissive redaction.
+    if not url_context and (
+        any(char.isspace() for char in prefix.lstrip(_URL_LEADING_C0_OR_SPACE)) or any(char.isspace() for char in query)
+    ):
+        return None
+    # Check inference before cleanup so removing newlines cannot turn source into a URL.
     # Retain URL query cleanup so raw controls cannot hide nested credential keys.
     query = query.replace("\t", "").replace("\r", "").replace("\n", "")
     redacted_query = _redact_query_string(query, depth)
@@ -1022,10 +1028,22 @@ def _looks_like_form_key(key: str) -> bool:
     return bool(key and _FORM_KEY_RE.fullmatch(key))
 
 
+def _is_url_or_path_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return normalized.endswith(("url", "uri", "path", "urls", "uris", "paths")) or normalized in {
+        "location",
+        "contentlocation",
+        "destination",
+        "endpoint",
+        "referer",
+        "referrer",
+    }
+
+
 def _redact_nested_sensitive_text(value: str, depth: int) -> str:
     if depth >= _MAX_TEXT_REDACTION_DEPTH or not _may_contain_sensitive_text(value):
         return value
-    return _redact_sensitive_text(value, depth + 1)
+    return _redact_sensitive_text(value, depth + 1, url_context=True)
 
 
 def _may_contain_sensitive_text(value: str) -> bool:

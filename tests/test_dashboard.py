@@ -33,6 +33,7 @@ from claude_tap.dashboard import (
     load_trace_session,
     read_dashboard_template,
     redact_dashboard_records,
+    redact_dashboard_summary,
 )
 from claude_tap.history import migrate_legacy_traces
 from claude_tap.live import LiveViewerServer, _record_limit_from_request
@@ -1706,13 +1707,185 @@ def test_dashboard_keeps_query_redaction_for_existing_url_candidates(value: str,
 
 
 @pytest.mark.parametrize(
+    "expression",
+    [
+        "token === expected",
+        "token==expected",
+        "token !== expected",
+        "token != expected",
+        "token >= expected",
+        "token <= expected",
+        "(token === expected)",
+        "!token !== expected",
+    ],
+)
+def test_dashboard_preserves_comparisons_after_multiline_comment(expression: str) -> None:
+    text = f"// Deliverables\uff1a only\nconst result = ready ? {expression} : fallback;"
+    fields = {key: text for key in ("old_string", "new_string", "code", "text", "content")}
+
+    assert redact_dashboard_records([fields]) == [fields]
+    summary = {key: text for key in ("first_user", "last_response", "sys_hint", "session_user_text")}
+    assert redact_dashboard_summary(summary) == summary
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "//note\nready?token===expected:fallback",
+        "//note\nreturn ready?token===expected:fallback",
+        "//note\r\nready?(token===expected):fallback",
+        "//note\nready?get_token()===expected:fallback",
+        "/allowed/.test(value)? token === expected : fallback",
+        "/allowed/.test(value) ?token===expected:fallback",
+        "/allowed/.test(value)?\u00a0token===expected:fallback",
+        "/allowed/.test(value)?token===expected:fallback\nconsole.log(result)",
+        "//note?token===expected:fallback\nconsole.log(result)",
+        "/allowed/.test(value)?\ntoken===expected:fallback",
+        "/allowed/.test(value)?\ttoken===expected:fallback",
+    ],
+    ids=[
+        "compact",
+        "return",
+        "parenthesized",
+        "call",
+        "query-space",
+        "prefix-space",
+        "unicode-space",
+        "trailing-line",
+        "trailing-comment-line",
+        "query-newline",
+        "query-tab",
+    ],
+)
+def test_dashboard_preserves_source_outside_standalone_uri_syntax(text: str) -> None:
+    assert redact_dashboard_records([{"old_string": text}]) == [{"old_string": text}]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "url",
+        "uri",
+        "path",
+        "request_url",
+        "redirect_uri",
+        "upstream_base_url",
+        "Location",
+        "Content-Location",
+        "Destination",
+        "endpoint",
+        "Referer",
+        "Referrer",
+    ],
+)
+def test_dashboard_uses_uri_field_context_for_ambiguous_text(key: str) -> None:
+    value = "// Deliverables\uff1a only\nconst result = ready ? token === expected : fallback"
+    expected = "// Deliverables\uff1a only\nconst result = ready ?+token+=REDACTED"
+    record = {key: value, "old_string": value, "access_token": "example-secret"}
+
+    assert redact_dashboard_records([record]) == [{key: expected, "old_string": value, "access_token": "REDACTED"}]
+    assert record == {key: value, "old_string": value, "access_token": "example-secret"}
+
+
+@pytest.mark.parametrize("key", ["url", "urls", "redirect_uris", "paths"])
+def test_dashboard_preserves_uri_context_through_lists_and_json(key: str) -> None:
+    uri = "// api host/path? token =example-secret#keep fragment"
+    expected = "// api host/path?+token+=REDACTED#keep fragment"
+    assert redact_dashboard_records([{key: [[uri]]}]) == [{key: [[expected]]}]
+    assert json.loads(redact_dashboard_records([{key: json.dumps([uri])}])[0][key]) == [expected]
+
+
+def test_dashboard_reclassifies_named_fields_inside_json_query_values() -> None:
+    text = "// Deliverables\uff1a only\nready?token===expected:fallback"
+    uri = "// api host/path? token =example-secret"
+    body = json.dumps({"old_string": [text], "redirect_uri": [uri], "client_secret": "json-secret"})
+
+    direct = json.loads(redact_dashboard_records([{"body": body}])[0]["body"])
+    nested = redact_dashboard_records([{"url": "https://host/path?payload=" + body}])[0]["url"]
+    decoded = json.loads(parse_qs(nested.partition("?")[2])["payload"][0])
+    expected = {
+        "old_string": [text],
+        "redirect_uri": ["// api host/path?+token+=REDACTED"],
+        "client_secret": "REDACTED",
+    }
+    assert direct == decoded == expected
+
+
+@pytest.mark.parametrize("key", ["body", "url"])
+@pytest.mark.parametrize("as_list", [False, True], ids=["object", "array"])
+def test_dashboard_does_not_reinterpret_unchanged_json_as_a_uri(key: str, as_list: bool) -> None:
+    content = {"old_string": "//note\nready?token===expected:fallback"}
+    value = json.dumps([content] if as_list else content, separators=(",", ":"))
+
+    assert redact_dashboard_records([{key: value}]) == [{key: value}]
+    nested = "https://host/path?payload=" + value
+    assert redact_dashboard_records([{"url": nested}]) == [{"url": nested}]
+
+
+@pytest.mark.parametrize("value", ["// api host/path?token=example-secret", "https://host/path? token =secret value"])
+def test_dashboard_does_not_infer_raw_whitespace_uri_from_ordinary_text(value: str) -> None:
+    assert redact_dashboard_records([{"text": value}]) == [{"text": value}]
+    uri = redact_dashboard_records([{"url": value}])[0]["url"]
+    assert parse_qs(uri.partition("?")[2]) in ({"token": ["REDACTED"]}, {" token ": ["REDACTED"]})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "?token===example-secret:fallback",
+        "?token!=example-secret:fallback",
+        "?token>=example-secret:fallback",
+        "?token<=example-secret:fallback",
+        "?%28token%21=%3Dexpected%29%3Afallback",
+        "?%20token%20=%3D%3D%20example-secret%20%3A%20fallback",
+        "/a=b?token===example-secret:fallback",
+        " \t//host=a/b?token!=example-secret:fallback",
+        "?payload=%3Ftoken%3D%3D%3Dexample-secret%3Afallback",
+        "https://host/path?payload=%2F%2F%20host%2Fpath%3Ftoken%3Dexample-secret",
+    ],
+)
+def test_dashboard_keeps_permissive_query_redaction_in_uri_context(value: str) -> None:
+    redacted = redact_dashboard_records([{"url": value}])[0]["url"]
+    assert "example-secret" not in redacted
+    pairs = parse_qs(redacted.partition("?")[2])
+    assert all("REDACTED" in nested for values in pairs.values() for nested in values)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("?token=example-secret", "?token=REDACTED"),
+        ("//host/path?token=example-secret", "//host/path?token=REDACTED"),
+        ("https://host\uff1a443/path?token=example-secret", "https://host\uff1a443/path?token=REDACTED"),
+        ("/a=b?token=example-secret", "/a=b?token=REDACTED"),
+        ("?%20token%20=example-secret", "?+token+=REDACTED"),
+        ("?token===expected:fallback", "?token=REDACTED"),
+        ("token==expected", "token=REDACTED"),
+    ],
+)
+def test_dashboard_keeps_standalone_uri_and_form_redaction_in_source_fields(value: str, expected: str) -> None:
+    # Compact URI/form bytes can also be source; retain credential masking for that ambiguity.
+    assert redact_dashboard_records([{"old_string": value}]) == [{"old_string": expected}]
+
+
+@pytest.mark.parametrize(
     "old_string",
     [
         "// Deliverables\uff1a only\nconst result = ready ? left : right;",
         "\n    ? token === expected\n    : fallback",
         "\n    /allowed/.test(value) && token === expected\n    ? token === cached\n    : fallback",
+        "// Deliverables\uff1a only\nconst result = ready ? token === expected : fallback;",
+        "//note\nreturn ready?token!==expected:fallback",
+        "/allowed/.test(value)? token === expected : fallback",
     ],
-    ids=["nfkc-punctuation", "indented-ternary", "regex-ternary"],
+    ids=[
+        "nfkc-punctuation",
+        "indented-ternary",
+        "regex-ternary",
+        "comment-comparison",
+        "compact-return",
+        "regex-space",
+    ],
 )
 @pytest.mark.asyncio
 async def test_dashboard_session_records_preserve_edit_code(trace_db, old_string: str) -> None:
@@ -1754,6 +1927,42 @@ async def test_dashboard_session_records_preserve_edit_code(trace_db, old_string
     assert displayed["body"]["messages"][1]["content"][0]["input"]["old_string"] == old_string
     assert displayed["url"] == "https://api.anthropic.com/v1/messages?access_token=REDACTED&client_id=public"
     assert displayed["headers"]["Authorization"] == "REDACTED"
+    assert store.load_records(session_id) == [record]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_session_views_preserve_source_comparisons(trace_db) -> None:
+    text = "// Deliverables\uff1a only\nconst result = ready ? token === expected : fallback;"
+    store = get_trace_store()
+    session_id = store.create_session(client="claude", proxy_mode="reverse")
+    record = _anthropic_record()
+    record["request"]["body"]["messages"][0]["content"] = text
+    record["request"]["body"]["system"] = text
+    record["request"]["url"] = "https://host/path?token=example-secret"
+    store.append_record(session_id, record)
+
+    server = LiveViewerServer(port=0, dashboard_mode=True)
+    port = await server.start()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{port}/api/sessions/{session_id}/records") as resp:
+                assert resp.status == 200
+                payload = await resp.json()
+            async with session.get(f"http://127.0.0.1:{port}/api/sessions/{session_id}/html") as resp:
+                assert resp.status == 200
+                html = await resp.text()
+    finally:
+        await server.stop()
+
+    displayed = payload["records"][0]["request"]
+    assert displayed["body"]["messages"][0]["content"] == text
+    assert displayed["body"]["system"] == text
+    assert displayed["url"] == "https://host/path?token=REDACTED"
+    assert payload["session"]["first_user"] == text.replace("\n", " ")
+    metadata_json = html.partition("const EMBEDDED_TRACE_META = ")[2].partition(";\n")[0]
+    metadata = json.loads(metadata_json.replace("<\\/", "</"))[0]
+    assert metadata["session_user_text"] == text
+    assert metadata["sys_hint"] == text
     assert store.load_records(session_id) == [record]
 
 
