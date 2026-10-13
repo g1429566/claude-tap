@@ -1570,9 +1570,152 @@ def test_dashboard_preserves_raw_query_controls_when_no_values_are_redacted(cont
     assert redact_dashboard_records([{"old_string": text}]) == [{"old_string": text}]
 
 
+@pytest.mark.parametrize(
+    ("surrogate", "encoded"), [("\ud800", "%ED%A0%80"), ("\udfff", "%ED%BF%BF")], ids=["high", "low"]
+)
+@pytest.mark.parametrize("prefix", ["", "/a=b", "https://host/path"], ids=["query-only", "path", "absolute"])
+def test_dashboard_redacts_query_values_with_lone_surrogates(prefix: str, surrogate: str, encoded: str) -> None:
+    value = f"{prefix}?label={surrogate}&token=example-secret"
+    records = [{"url": value}]
+
+    assert redact_dashboard_records(records) == [{"url": f"{prefix}?label={encoded}&token=REDACTED"}]
+    assert records == [{"url": value}]
+
+
+@pytest.mark.parametrize(
+    ("surrogate", "encoded"), [("\ud800", "%ED%A0%80"), ("\udfff", "%ED%BF%BF")], ids=["high", "low"]
+)
+@pytest.mark.parametrize("nested", [False, True], ids=["form", "form-inside-query"])
+def test_dashboard_redacts_form_values_with_lone_surrogates(surrogate: str, encoded: str, nested: bool) -> None:
+    value = f"label={surrogate}&client_secret=example-secret"
+    if nested:
+        value = f"https://host/path?payload=label={surrogate}%26client_secret=example-secret"
+
+    redacted = redact_dashboard_records([{"body": value}])[0]["body"]
+
+    if nested:
+        assert parse_qs(redacted.partition("?")[2]) == {"payload": [f"label={encoded}&client_secret=REDACTED"]}
+    else:
+        assert redacted == f"label={encoded}&client_secret=REDACTED"
+
+
+@pytest.mark.parametrize("surrogate", ["\ud800", "\udfff"], ids=["high", "low"])
+def test_dashboard_redacts_json_values_with_lone_surrogates_inside_query(surrogate: str) -> None:
+    value = "https://host/path?payload=" + json.dumps({"label": surrogate, "token": "example-secret"})
+
+    redacted = redact_dashboard_records([{"url": value}])[0]["url"]
+
+    payload = parse_qs(redacted.partition("?")[2], errors="surrogatepass")["payload"][0]
+    assert json.loads(payload) == {"label": surrogate, "token": "REDACTED"}
+
+
+@pytest.mark.parametrize("escaped", ["\\ud800", "\\udfff"], ids=["high", "low"])
+def test_dashboard_redacts_query_with_lone_surrogate_in_json_text(escaped: str) -> None:
+    value = '{"old_string":"?label=' + escaped + '&token=example-secret"}'
+
+    redacted = redact_dashboard_records([{"body": value}])[0]["body"]
+
+    old_string = json.loads(redacted)["old_string"]
+    assert parse_qs(old_string.partition("?")[2], errors="surrogatepass") == {
+        "label": [json.loads('"' + escaped + '"')],
+        "token": ["REDACTED"],
+    }
+
+
 @pytest.mark.asyncio
-async def test_dashboard_session_records_preserve_edit_code_with_nfkc_punctuation(trace_db) -> None:
-    old_string = "// Deliverables\uff1a only\nconst result = ready ? left : right;"
+async def test_dashboard_session_endpoints_accept_json_query_with_lone_surrogate(trace_db) -> None:
+    store = get_trace_store()
+    session_id = store.create_session(client="claude", proxy_mode="reverse")
+    record = _anthropic_record()
+    record["request"]["body"]["messages"][0]["content"] = json.dumps(
+        {"old_string": "?label=\ud800&token=example-secret"}
+    )
+    store.append_record(session_id, record)
+
+    server = LiveViewerServer(port=0, dashboard_mode=True)
+    port = await server.start()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{port}/api/sessions/{session_id}/records") as resp:
+                assert resp.status == 200
+                payload = await resp.json()
+            async with session.get(f"http://127.0.0.1:{port}/api/sessions/{session_id}/html") as resp:
+                assert resp.status == 200
+                html = await resp.text()
+    finally:
+        await server.stop()
+
+    content = payload["records"][0]["request"]["body"]["messages"][0]["content"]
+    assert json.loads(content) == {"old_string": "?label=%ED%A0%80&token=REDACTED"}
+    assert html.startswith("<!DOCTYPE html>")
+    assert store.load_records(session_id) == [record]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\n    ? token === expected\n    : fallback",
+        "\t? access_token === expected\n: fallback",
+        "\r\n    ? client_secret !== expected\r\n    : fallback",
+        "\n    /allowed/.test(value) && token === expected\n    ? token === cached\n    : fallback",
+        "\n    /allowed/.test(value) && access_token === expected\n    ? access_token === cached\n    : fallback",
+        " ?token=public",
+        " //?token=public",
+        " /a=b?token=public",
+        " ///a=b?token=public",
+    ],
+    ids=[
+        "indented-ternary",
+        "tab-ternary",
+        "crlf-ternary",
+        "regex-ternary",
+        "regex-access-token",
+        "indented-query-only",
+        "indented-empty-authority",
+        "indented-equals-path",
+        "indented-empty-authority-equals-path",
+    ],
+)
+def test_dashboard_preserves_source_text_outside_url_candidate_scope(text: str) -> None:
+    assert redact_dashboard_records([{"old_string": text}]) == [{"old_string": text}]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("?token=example-secret", "?token=REDACTED"),
+        ("/a=b?token=example-secret", "/a=b?token=REDACTED"),
+        (" \t//host?token=example-secret", " \t//host?token=REDACTED"),
+        (" \t//host/a=b?token=example-secret", " \t//host/a=b?token=REDACTED"),
+        (" \t//host=a/b?token=example-secret", " \t//host=a/b?token=REDACTED"),
+        (" \t///path?token=example-secret", " \t///path?token=REDACTED"),
+        (" \thttps://host/a=b?token=example-secret", " \thttps://host/a=b?token=REDACTED"),
+    ],
+    ids=[
+        "query-only",
+        "equals-path",
+        "network-authority",
+        "network-equals-path",
+        "equals-authority",
+        "empty-authority-path",
+        "scheme",
+    ],
+)
+def test_dashboard_keeps_query_redaction_for_existing_url_candidates(value: str, expected: str) -> None:
+    assert redact_dashboard_records([{"url": value}]) == [{"url": expected}]
+
+
+@pytest.mark.parametrize(
+    "old_string",
+    [
+        "// Deliverables\uff1a only\nconst result = ready ? left : right;",
+        "\n    ? token === expected\n    : fallback",
+        "\n    /allowed/.test(value) && token === expected\n    ? token === cached\n    : fallback",
+    ],
+    ids=["nfkc-punctuation", "indented-ternary", "regex-ternary"],
+)
+@pytest.mark.asyncio
+async def test_dashboard_session_records_preserve_edit_code(trace_db, old_string: str) -> None:
     store = get_trace_store()
     session_id = store.create_session(client="claude", proxy_mode="reverse")
     record = _anthropic_record()

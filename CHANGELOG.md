@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Redact URL queries without parsing their authority, preserving code snippets and malformed URL prefixes instead of returning HTTP 500.
-- Retain raw TAB/CR/LF cleanup in URL queries so nested form credentials remain redacted.
+- Fix dashboard query redaction for code snippets and malformed URLs, preserving URL/path candidate rules and prefix/fragment text.
+  Retain query control-character cleanup and safely encode lone Unicode surrogates so nested credentials remain masked.
 
 - Ignore object key order in viewer parameter diffs and sort displayed JSON to highlight actual value changes.
 

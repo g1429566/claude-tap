@@ -983,7 +983,7 @@ def _redact_form_text(value: str, depth: int = 0) -> str | None:
     ]
     if redacted_pairs == pairs:
         return None
-    return urlencode(redacted_pairs)
+    return urlencode(redacted_pairs, errors="surrogatepass")
 
 
 def _redact_query_string(query: str, depth: int = 0) -> str | None:
@@ -1001,18 +1001,21 @@ def _redact_query_string(query: str, depth: int = 0) -> str | None:
     ]
     if redacted_pairs == pairs:
         return None
-    return urlencode(redacted_pairs)
+    return urlencode(redacted_pairs, errors="surrogatepass")
 
 
 def _looks_like_url_or_path(prefix: str) -> bool:
     # Match the parser's candidate cleanup without changing the original text.
     candidate = prefix.lstrip(_URL_LEADING_C0_OR_SPACE).replace("\t", "").replace("\r", "").replace("\n", "")
-    return bool(
-        not candidate
-        or _URL_SCHEME_RE.match(candidate)
-        or candidate.startswith("/")
-        or ("/" in candidate and "=" not in candidate)
-    )
+    # Keep query-only and root-path checks anchored to the original prefix.
+    if not prefix or _URL_SCHEME_RE.match(candidate) or prefix.startswith("/"):
+        return True
+    if candidate.startswith("//"):
+        authority, separator, path = candidate[2:].partition("/")
+        if authority:
+            return True
+        candidate = separator + path
+    return "/" in candidate and "=" not in candidate
 
 
 def _looks_like_form_key(key: str) -> bool:
