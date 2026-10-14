@@ -658,6 +658,27 @@ class TraceStore:
             )
             conn.commit()
 
+    def cache_summary_if_unchanged(self, row: sqlite3.Row, summary: dict[str, Any]) -> bool:
+        """Cache derived fields only while the source session snapshot matches."""
+        with self._write_access() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE sessions SET summary_json = ?
+                WHERE id = ? AND summary_json IS ? AND status IS ?
+                    AND updated_at IS ? AND record_count IS ?
+                """,
+                (
+                    json.dumps(summary, ensure_ascii=False, separators=(",", ":")),
+                    row["id"],
+                    row["summary_json"],
+                    row["status"],
+                    row["updated_at"],
+                    row["record_count"],
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
     def dashboard_snapshot(self) -> dict[str, tuple[int, str]]:
         """Return session_id -> (record_count, status) for dashboard refresh detection.
 

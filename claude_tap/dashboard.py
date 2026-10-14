@@ -396,6 +396,35 @@ def _session_summary_from_row(
     allow_record_scan: bool = False,
     repair_stale_summary: bool = True,
 ) -> dict[str, Any]:
+    while True:
+        summary, needs_cache = _build_session_summary_from_row(
+            store, row, allow_record_scan=allow_record_scan, repair_stale_summary=repair_stale_summary
+        )
+        if not needs_cache:
+            return summary
+        # A rebuilt preview may use older record timestamps. Session metadata
+        # belongs to the row snapshot, including later log heartbeats.
+        normalized_summary = _normalize_cached_session_summary(row, summary)
+        cache_summary = normalized_summary
+        if summary.get("status") == "error":
+            # Active-session SQL filters use this derived error marker without
+            # changing the authoritative session status.
+            cache_summary = {**normalized_summary, "status": "error"}
+        if store.cache_summary_if_unchanged(row, cache_summary):
+            return normalized_summary
+        current_row = store.load_session_row(row["id"])
+        if current_row is None:
+            return normalized_summary
+        row = current_row
+
+
+def _build_session_summary_from_row(
+    store: TraceStore,
+    row: sqlite3.Row,
+    *,
+    allow_record_scan: bool,
+    repair_stale_summary: bool,
+) -> tuple[dict[str, Any], bool]:
     summary_json = row["summary_json"]
     if summary_json:
         try:
@@ -408,9 +437,8 @@ def _session_summary_from_row(
                 boundary_records = store.load_boundary_records(row["id"])
                 if boundary_records:
                     summary = _summary_from_boundary_records(row, boundary_records, cached)
-                    store.store_summary(row["id"], summary)
-                    return summary
-            return _normalize_cached_session_summary(row, cached)
+                    return summary, True
+            return _normalize_cached_session_summary(row, cached), False
 
     record_count = int(row["record_count"] or 0)
     manifest_entry = {
@@ -431,9 +459,7 @@ def _session_summary_from_row(
             record_count=0,
         )
         summary["active"] = row["status"] == "active"
-        if row["status"] != "active":
-            store.store_summary(row["id"], summary)
-        return redact_dashboard_summary(summary)
+        return redact_dashboard_summary(summary), row["status"] != "active"
 
     if not allow_record_scan:
         if row["status"] == "error":
@@ -451,9 +477,8 @@ def _session_summary_from_row(
                     is_current=False,
                     record_count=record_count,
                 )
-                store.store_summary(row["id"], summary)
-                return summary
-        return _minimal_session_summary_from_row(row)
+                return summary, True
+        return _minimal_session_summary_from_row(row), False
 
     records = store.load_records(row["id"])
     summary = _summarize_session(
@@ -469,9 +494,7 @@ def _session_summary_from_row(
         record_count=record_count,
     )
     summary["active"] = row["status"] == "active"
-    if row["status"] != "active":
-        store.store_summary(row["id"], summary)
-    return redact_dashboard_summary(summary)
+    return redact_dashboard_summary(summary), row["status"] != "active"
 
 
 def _minimal_session_summary_from_row(row: sqlite3.Row) -> dict[str, Any]:
