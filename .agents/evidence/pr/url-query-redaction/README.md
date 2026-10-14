@@ -35,19 +35,21 @@ return HTTP 500 before the fix, with the server traceback containing an NFKC
 after the fix; the actual Edit strings and captured prompt are preserved.
 The original model responses are HTTP 200 throughout.
 
-- `trace-viewer-multiturn-fixed.jpg` is the primary trace evidence. It directly
-  captures the actual fixed viewer,
+- `trace-viewer-multiturn-fixed.png` directly captures the actual fixed viewer,
   selecting the Edit-producing record and expanding its escaped input strings.
   The sidebar shows all six requests and the header shows nonzero token usage.
-- `trace-viewer-multiturn-baseline-500.jpg` is supplementary failure evidence.
-  It directly captures the records endpoint's native HTTP 500 response page
-  for the same multi-turn session.
+- `trace-viewer-multiturn-baseline-network.png` directly captures Chromium's
+  native DevTools Network Headers for a real GET of the original server's
+  records endpoint. The underlying `/dashboard` page returned HTTP 200; the
+  records request returned HTTP 500. The panel shows the complete session URL,
+  GET method, status 500 and dashboard referrer.
 
-Both images retain the JPEG bytes returned by the browser screenshot API.
-No image editing or compositing was performed. The baseline error page is the
-intentional reproduced failure state, paired with the working viewer.
-Both images were visually inspected; the screenshot checker reported no
-failures, with warnings that JPEG blankness analysis is unsupported.
+Both images are direct lossless PNG browser captures at a 1280x900 CSS viewport
+and 2x device scale (2560x1800 image pixels). Playwright captured the viewer;
+Playwright CDP captured the native undocked DevTools frontend. Browser UI
+controls selected the record and expanded its strings. No image conversion,
+compositing, pixel processing or DOM content modification was performed.
+Both images were visually inspected and passed the screenshot checker.
 
 Regression tests additionally cover URI context, surrounding and internal
 whitespace, nested credentials, control characters, JSON and lone surrogates.
