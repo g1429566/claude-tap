@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse
+from urllib.parse import SplitResult, parse_qsl, quote_plus, unquote_plus, urlencode, urlparse, urlsplit
 
 from claude_tap.bedrock import bedrock_model_from_path
 from claude_tap.trace_encoding import (
@@ -40,7 +40,7 @@ CLIENT_LABELS = {
     "pi": "Pi",
     "qoder": "Qoder",
 }
-DASHBOARD_SUMMARY_VERSION = 4
+DASHBOARD_SUMMARY_VERSION = 5
 VALID_SESSION_STATUSES = {"active", "complete", "error", "empty"}
 _REDACTED_VALUE = "REDACTED"
 _SENSITIVE_KEY_NAMES = {
@@ -70,6 +70,17 @@ _LINK_HEADER_RE = re.compile(rf"[ \t,]*{_LINK_VALUE_PATTERN}(?:[ \t]*,[ \t,]*{_L
 _LINK_HEADER_PART_RE = re.compile(
     rf"<(?P<target>[^<>]*)>|(?P<name>{_HTTP_TOKEN_PATTERN})"
     rf"(?:(?P<assignment>[ \t]*=[ \t]*)(?P<value>{_HTTP_QUOTED_PATTERN}|{_HTTP_TOKEN_PATTERN}))?"
+)
+_EXCEPTION_QUOTED_VALUE = r""""(?:\\[\s\S]|[^"\\\r\n\u2028\u2029])*"|'(?:\\[\s\S]|[^'\\\r\n\u2028\u2029])*'"""
+_EXCEPTION_SOURCE_TOKEN_RE = re.compile(
+    rf"(?P<comment>//[^\r\n\u2028\u2029]*|/\*[\s\S]*?(?:\*/|$))|(?P<literal>{_EXCEPTION_QUOTED_VALUE})"
+)
+_LITERAL_UNIT_RE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[\s\S])|[^\\]")
+_LITERAL_QUESTION_RE = re.compile(r"\\(?:u003[fF]|x3[fF])")
+_EXCEPTION_ASSIGNMENT_RE = re.compile(
+    r"(?P<delimiter>[?&])(?P<key>[A-Za-z0-9_%+.\-\[\] \t\r\n]{1,128})=(?![=>])(?P<padding>[ \t\r\n]*)"
+    rf"""(?P<value>{_EXCEPTION_QUOTED_VALUE}|[^&\s;:,()[\]{{}}"'<>|^!\x60]*)"""
+    r"(?=[&\s;:,)\]}]|$)"
 )
 _MAX_TEXT_REDACTION_DEPTH = 8
 
@@ -393,11 +404,7 @@ def _session_summary_from_row(
             cached = None
         if isinstance(cached, dict) and (not cached.get("id") or cached.get("id") == row["id"]):
             needs_error_repair = row["status"] == "error" and not cached.get("error")
-            if (
-                repair_stale_summary
-                and row["status"] != "active"
-                and (not is_dashboard_summary_current(cached, row["id"]) or needs_error_repair)
-            ):
+            if repair_stale_summary and (not is_dashboard_summary_current(cached, row["id"]) or needs_error_repair):
                 boundary_records = store.load_boundary_records(row["id"])
                 if boundary_records:
                     summary = _summary_from_boundary_records(row, boundary_records, cached)
@@ -542,7 +549,9 @@ def _normalize_cached_session_summary(row: sqlite3.Row, cached: dict[str, Any]) 
     summary = _minimal_session_summary_from_row(row)
     summary.update(cached)
     summary["id"] = row["id"]
-    summary["summary_version"] = DASHBOARD_SUMMARY_VERSION
+    # Normalizing cached fields cannot recover raw text lost by old previews.
+    # Only a raw-record rebuild can certify the current summary version.
+    summary["summary_version"] = cached.get("summary_version")
     summary["date"] = row["date_key"] if _DATE_RE.match(row["date_key"] or "") else "legacy"
     summary["legacy_rel_path"] = row["legacy_rel_path"]
     summary["started_at"] = row["started_at"] or summary.get("started_at") or ""
@@ -942,14 +951,23 @@ def _redact_sensitive_value(value: Any, key: str = "", *, header_context: bool =
     if isinstance(value, list):
         return [_redact_sensitive_value(item, key, header_context=header_context) for item in value]
     if isinstance(value, str):
+        uri_reference = _is_url_or_path_key(key)
         return _redact_sensitive_text(
-            value, url_context=header_context or _is_url_or_path_key(key), header_key=key if header_context else None
+            value,
+            url_context=header_context or uri_reference,
+            uri_reference=uri_reference,
+            header_key=key if header_context else None,
         )
     return value
 
 
 def _redact_sensitive_text(
-    value: str, depth: int = 0, *, url_context: bool = False, header_key: str | None = None
+    value: str,
+    depth: int = 0,
+    *,
+    url_context: bool = False,
+    uri_reference: bool = False,
+    header_key: str | None = None,
 ) -> str:
     stripped = value.strip()
     if not stripped:
@@ -962,7 +980,7 @@ def _redact_sensitive_text(
         if parsed is not None:
             redacted = _redact_sensitive_value(
                 parsed,
-                header_key if header_key is not None else "url" if url_context else "",
+                header_key if header_key is not None else "url" if uri_reference else "",
                 header_context=header_key is not None,
             )
             return value if redacted == parsed else json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
@@ -970,45 +988,252 @@ def _redact_sensitive_text(
         redacted_link = _redact_link_header(value, depth)
         if redacted_link is not None:
             return redacted_link
-    redacted_url = _redact_url_query(value, depth, url_context=url_context)
+    redacted_url = _redact_url_query(value, depth, url_context=url_context, uri_reference=uri_reference)
     if redacted_url is not None:
         return redacted_url
     redacted_form = _redact_form_text(value, depth)
     return value if redacted_form is None else redacted_form
 
 
-def _redact_url_query(value: str, depth: int = 0, *, url_context: bool = False) -> str | None:
+def _redact_url_query(
+    value: str, depth: int = 0, *, url_context: bool = False, uri_reference: bool = False
+) -> str | None:
+    if "?" not in value and ("\\" not in value or not _LITERAL_QUESTION_RE.search(value)):
+        return None
+    if not uri_reference and not _looks_like_url_or_path(value.partition("?")[0]):
+        return None
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return _redact_invalid_url_text(value, depth, uri_context=url_context)
     # Surrounding whitespace does not change a standalone URI's meaning.
     url_text = value if url_context else value.rstrip()
     trailing_whitespace = value[len(url_text) :]
     before_fragment = url_text.partition("#")[0]
     prefix, query_separator, query = before_fragment.partition("?")
-    if not query_separator or not query or not _looks_like_url_or_path(prefix):
+    if not query_separator or not query:
         return None
-    # Query redaction does not need to parse or validate an arbitrary authority.
-    # Infer a URL only from a standalone token, not whitespace-separated source.
-    # Named URI fields and decoded query/form values retain permissive redaction.
-    if not url_context and (
-        any(char.isspace() for char in re.sub(r"^[\x00-\x20\s]+", "", prefix)) or any(char.isspace() for char in query)
-    ):
-        return None
-    redacted = _redact_uri_query(url_text, depth)
+    # A successful parse does not establish a URI: keep the source inference
+    # guard. Decoded query/form values retain whitespace permissiveness, while
+    # only named URI fields can establish a bare relative reference here.
+    if not url_context:
+        # urlsplit cleans raw TAB/CR/LF within confirmed absolute URIs. A
+        # successful parse alone must not turn source expressions into URIs.
+        absolute_uri = bool(parsed.scheme)
+        inference_text = prefix + "?" + query
+        if absolute_uri:
+            inference_text = inference_text.replace("\t", "").replace("\r", "").replace("\n", "")
+        if any(char.isspace() for char in re.sub(r"^[\x00-\x20\s]+", "", inference_text)):
+            return None
+    redacted = _redact_uri_query(url_text, depth, parsed=parsed)
     return None if redacted is None else redacted + trailing_whitespace
 
 
-def _redact_uri_query(value: str, depth: int = 0) -> str | None:
+def _redact_uri_query(value: str, depth: int = 0, *, parsed: SplitResult | None = None) -> str | None:
     # This receives an established URI reference, including relative Link targets.
     before_fragment, fragment_separator, fragment = value.partition("#")
     prefix, query_separator, query = before_fragment.partition("?")
     if not query_separator or not query:
         return None
-    # Candidate inference happens before cleanup so removing newlines cannot turn source into a URL.
-    # Retain URL query cleanup so raw controls cannot hide nested credential keys.
-    query = query.replace("\t", "").replace("\r", "").replace("\n", "")
-    redacted_query = _redact_query_string(query, depth)
+    if parsed is None:
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            redacted = _redact_invalid_url_text(value, depth, uri_context=True)
+            return None if redacted == value else redacted
+    # Reuse the standard parser's query cleanup. Keep the presentation envelope
+    # so scheme spelling, raw prefix controls and Link syntax remain untouched.
+    redacted_query = _redact_query_string(parsed.query, depth)
     if redacted_query is None:
         return None
     return f"{prefix}?{redacted_query}{fragment_separator}{fragment}"
+
+
+def _redact_invalid_url_text(value: str, depth: int, *, uri_context: bool = False) -> str:
+    """Redact failed authority parses without re-encoding the surrounding text.
+
+    Declared URI fields, absolute URI schemes and network authorities without
+    whitespace use query semantics, including values beginning with '='.
+    Other text supports ?/& assignments with a single '=' and either quoted
+    strings or simple scalar tokens. Comparison operators remain source text.
+    This is an assignment grammar, not a programming-language parser.
+    """
+    prefix, separator, query = value.partition("?")
+    if separator and query and (uri_context or _exception_has_uri_origin(prefix)):
+        before_fragment, fragment_separator, fragment = value.partition("#")
+        prefix, separator, query = before_fragment.partition("?")
+        query = query.replace("\t", "").replace("\r", "").replace("\n", "")
+        redacted_query = _redact_query_string(query, depth) if separator else None
+        return value if redacted_query is None else prefix + separator + redacted_query + fragment_separator + fragment
+
+    def redact_uri_literal(match: re.Match[str]) -> str:
+        literal = match.group(0)
+        if match.group("literal") is None:
+            return literal
+        content = literal[1:-1]
+        decoded = _decode_literal_content(content)
+        # A quoted string is not automatically a URI. Decoding is used only
+        # for URI inference; edits retain unrelated escapes in the raw literal.
+        if not _exception_has_uri_origin(decoded.partition("?")[0]):
+            return literal
+        try:
+            parsed = urlsplit(decoded)
+        except ValueError:
+            parsed = None
+        if parsed is not None and not parsed.query:
+            return literal
+        redacted = _redact_exception_uri_literal(content, depth + 1)
+        return literal[0] + redacted + literal[-1]
+
+    source = _EXCEPTION_SOURCE_TOKEN_RE.sub(redact_uri_literal, value)
+    literal_spans = [
+        (match.start(), match.end())
+        for match in _EXCEPTION_SOURCE_TOKEN_RE.finditer(source)
+        if match.group("literal") is not None
+    ]
+
+    def redact_assignment(match: re.Match[str]) -> str:
+        raw_key, raw_value = match.group("key", "value")
+        if any(start <= match.start() < end for start, end in literal_spans):
+            return match.group(0)
+        continuation = _source_assignment_continuation(source, match.end())
+        if continuation and continuation[0] not in "&;:,)]}":
+            return match.group(0)
+        if raw_value.startswith(("/*", "//")):
+            return match.group(0)
+        decoded_key = unquote_plus(raw_key.replace("\t", "").replace("\r", "").replace("\n", "")).strip()
+        if not _looks_like_form_key(decoded_key):
+            return match.group(0)
+        quoted = raw_value[:1] in {"'", '"'}
+        content = raw_value[1:-1] if quoted else raw_value
+        json_quoted = False
+        if raw_value.startswith('"'):
+            try:
+                content = json.loads(raw_value)
+                json_quoted = True
+            except json.JSONDecodeError:
+                pass
+        redacted = _redact_exception_value(raw_key, content, depth)
+        if redacted == content:
+            return match.group(0)
+        if json_quoted:
+            replacement = json.dumps(redacted, ensure_ascii=False)
+        else:
+            replacement = raw_value[0] + redacted + raw_value[-1] if quoted else redacted
+        # Decoding a nested JSON escape can produce a lone surrogate. Keep it
+        # escaped in displayed source so the HTML response remains UTF-8 safe.
+        replacement = re.sub(r"[\ud800-\udfff]", lambda item: f"\\u{ord(item.group(0)):04x}", replacement)
+        return match.group("delimiter") + raw_key + "=" + match.group("padding") + replacement
+
+    return _EXCEPTION_ASSIGNMENT_RE.sub(redact_assignment, source)
+
+
+def _source_assignment_continuation(value: str, offset: int) -> str:
+    """Check a simple assignment's complete value past whitespace/comments."""
+    continuation = value[offset:].lstrip()
+    while continuation.startswith(("//", "/*")):
+        if continuation.startswith("//"):
+            lines = re.split(r"[\r\n\u2028\u2029]", continuation, maxsplit=1)
+            if len(lines) != 2:
+                return ""
+            continuation = lines[1]
+        else:
+            _comment, separator, continuation = continuation.partition("*/")
+            if not separator:
+                return ""
+        continuation = continuation.lstrip()
+    return continuation
+
+
+def _redact_exception_uri_literal(value: str, depth: int) -> str:
+    """Map a confirmed literal's query values to raw spans in one pass."""
+    pair_start = None
+    assignment = None
+    replacements = []
+
+    def finish_pair(end: int) -> None:
+        if pair_start is None or assignment is None:
+            return
+        key_end, value_start = assignment
+        raw_key, raw_value = value[pair_start:key_end], value[value_start:end]
+        redacted = _redact_exception_value(raw_key, raw_value, depth, encode_nested=True, literal=True)
+        if redacted != raw_value:
+            replacements.append((value_start, end, redacted))
+
+    for match in _LITERAL_UNIT_RE.finditer(value):
+        char = _decode_literal_unit(match.group(0))
+        if char == "#":
+            finish_pair(match.start())
+            break
+        if pair_start is None:
+            if char == "?":
+                pair_start = match.end()
+        elif char == "=" and assignment is None:
+            assignment = (match.start(), match.end())
+        elif char == "&":
+            finish_pair(match.start())
+            pair_start, assignment = match.end(), None
+    else:
+        finish_pair(len(value))
+    parts = []
+    offset = 0
+    for start, end, redacted in replacements:
+        parts.extend((value[offset:start], redacted))
+        offset = end
+    parts.append(value[offset:])
+    return "".join(parts)
+
+
+def _decode_literal_unit(unit: str) -> str:
+    if not unit.startswith("\\"):
+        return unit
+    if (unit.startswith("\\u") and len(unit) == 6) or (unit.startswith("\\x") and len(unit) == 4):
+        codepoint = int(unit[2:], 16)
+        return chr(codepoint)
+    if unit == "\\'":
+        return "'"
+    try:
+        return json.loads('"' + unit + '"')
+    except json.JSONDecodeError:
+        return unit
+
+
+def _decode_literal_content(value: str) -> str:
+    decoded = "".join(_decode_literal_unit(match.group(0)) for match in _LITERAL_UNIT_RE.finditer(value))
+    # JSON/JS Unicode escapes use UTF-16 units; combine valid surrogate pairs
+    # while retaining lone units for the existing safe-output handling.
+    return decoded.encode("utf-16", errors="surrogatepass").decode("utf-16", errors="surrogatepass")
+
+
+def _exception_has_uri_origin(prefix: str) -> bool:
+    candidate = prefix.lstrip(_URL_LEADING_C0_OR_SPACE)
+    if _URL_SCHEME_RE.match(_url_candidate_prefix(candidate)):
+        return True
+    if candidate.startswith("//"):
+        authority = candidate[2:].partition("/")[0]
+        return bool(authority) and not any(char.isspace() for char in authority)
+    return _looks_like_url_or_path(prefix) and not any(char.isspace() for char in candidate)
+
+
+def _redact_exception_value(
+    raw_key: str, raw_value: str, depth: int, *, encode_nested: bool = False, literal: bool = False
+) -> str:
+    clean_key = raw_key.replace("\t", "").replace("\r", "").replace("\n", "")
+    clean_value = raw_value.replace("\t", "").replace("\r", "").replace("\n", "")
+    if literal:
+        clean_key = _decode_literal_content(clean_key)
+        clean_value = _decode_literal_content(clean_value)
+        clean_key = clean_key.replace("\t", "").replace("\r", "").replace("\n", "")
+        clean_value = clean_value.replace("\t", "").replace("\r", "").replace("\n", "")
+    decoded_key, decoded_value = unquote_plus(clean_key), unquote_plus(clean_value)
+    if not decoded_value:
+        return raw_value
+    if _is_sensitive_key(decoded_key):
+        return _REDACTED_VALUE
+    redacted = _redact_nested_sensitive_text(decoded_value, depth)
+    if redacted == decoded_value:
+        return raw_value
+    return quote_plus(redacted, errors="surrogatepass") if encode_nested or decoded_value != raw_value else redacted
 
 
 def _redact_link_header(value: str, depth: int) -> str | None:
@@ -1256,7 +1481,7 @@ def _first_user_preview(records: list[dict[str, Any]]) -> str:
         headers = request.get("headers") if isinstance(request, dict) else None
         text = _request_user_text(body, headers=headers)
         if text:
-            return _preview(text, 220)
+            return _preview(_redact_sensitive_text(text), 220)
     return ""
 
 
@@ -1264,7 +1489,7 @@ def _last_response_preview(records: list[dict[str, Any]]) -> str:
     for record in reversed(records):
         text = _record_response_text(record)
         if text:
-            return _preview(text, 220)
+            return _preview(_redact_sensitive_text(text), 220)
     return ""
 
 
