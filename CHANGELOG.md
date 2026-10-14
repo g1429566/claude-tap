@@ -9,10 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Fix session records and HTML viewer failures from malformed URL authorities without parsing captured text as an authority.
-  Infer URLs from standalone text tokens while retaining HTTP-header, explicit URI and nested query/form credential redaction,
-  surrounding whitespace, original prefix/fragment text, query control cleanup and safe encoding of lone surrogates.
-  Redact Link target and URI parameter queries individually while preserving header syntax and empty list members.
+- Fix session records and HTML viewer failures when captured text triggers URL authority validation errors.
+  Keep normal redaction behavior and reuse existing query/form rules during exception recovery.
+  Preserve source comments and recover standalone or quoted URI queries, including network references without paths
+  and static backtick literals; conservatively hide candidates that cannot be safely recovered.
 
 - Ignore object key order in viewer parameter diffs and sort displayed JSON to highlight actual value changes.
 

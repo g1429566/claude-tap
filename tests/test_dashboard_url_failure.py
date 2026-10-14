@@ -1,6 +1,8 @@
 """Contracts for exception-only URL recovery using the original redactors."""
 
 import json
+from itertools import product
+from urllib.parse import quote_plus
 
 import aiohttp
 import pytest
@@ -83,7 +85,7 @@ def test_failed_uri_nested_values_use_original_query_and_field_rules(query: str,
     assert record["content"] == value
 
 
-@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
 @pytest.mark.parametrize(
     "uri",
     [
@@ -254,9 +256,222 @@ def test_second_layer_redacts_clear_network_query_despite_space_in_authority() -
     assert record == {"old_string": text}
 
 
+@pytest.mark.parametrize("path", ["", "/path", "/path;param=value"])
+@pytest.mark.parametrize("quote", ["", "'", '"', "`"])
+def test_network_uri_variations_never_expose_query_credentials(path: str, quote: str) -> None:
+    # Independent input dimensions exercise the URI grammar, not the recovery regex.
+    for delimiter in "!$&'()*+,;=:":
+        uri = f"//user{delimiter}name@host：443{path}?access_token=actual-secret&public=keep#fragment"
+        if quote:
+            content = uri.replace(quote, "\\" + quote)
+            text = "// Deliverables： only\nconst u = " + quote + content + quote + ";\nconst keep = 1;"
+        else:
+            text = uri
+        record = {"old_string": text}
+        output = dashboard.redact_dashboard_records([record])[0]["old_string"]
+        assert "actual-secret" not in output, (delimiter, path, quote, output)
+        assert "REDACTED" in output
+        if quote and quote in uri:
+            # Escaped source uses a bounded conservative replacement.
+            assert output.endswith(quote + ";\nconst keep = 1;")
+        else:
+            assert output == text.replace("actual-secret", "REDACTED")
+        assert record == {"old_string": text}
+
+
+def test_failed_uri_query_combinations_preserve_public_text_and_hide_secrets() -> None:
+    authorities = [
+        "//host：443",
+        "//user=name@host：443",
+        "//[broken",
+        "https://host：443",
+        "https://[broken",
+        "//host／part",
+        "//host＠name",
+        "//host＃part",
+    ]
+    queries = [
+        "access_token=actual-secret",
+        "%61ccess_token=actual-secret",
+        "access_\ntoken=actual-secret",
+        "payload=" + quote_plus("client_secret=actual-secret"),
+        "payload=" + quote_plus('{"token":"actual-secret"}'),
+    ]
+    for authority, path, query, quote in product(authorities, ["", "/path"], queries, ["", "'", '"', "`"]):
+        uri = authority + path + "?" + query + "&public=keep"
+        before = "// Deliverables： only\nconst u = " + quote if quote else ""
+        after = quote + ";\nconst keep = 1;" if quote else ""
+        text = before + uri + after
+        output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+        assert "actual-secret" not in output, (text, output)
+        assert output.startswith(before + authority + path + "?")
+        assert output.endswith("&public=keep" + after)
+        assert "REDACTED" in output
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+def test_multiple_uri_literals_are_each_processed(quote: str) -> None:
+    first = "//user=name@host：443?token=first-secret"
+    second = "//host：443?token=second-secret"
+    text = f"// Deliverables： only\nconst a = {quote}{first}{quote}; const b = {quote}{second}{quote};"
+    output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+    assert output == text.replace("first-secret", "REDACTED").replace("second-secret", "REDACTED")
+
+
+@pytest.mark.parametrize("comment", ["// Verify： ready", "//Verify： ready", "// Verify："])
+@pytest.mark.parametrize("operator", ["===", "==", "=~", "!=", "<=", ">="])
+def test_same_line_comment_query_does_not_consume_source(comment: str, operator: str) -> None:
+    text = f"{comment}? token {operator} expected\nconst keep = 1;"
+    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": text}]
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+def test_unclosed_network_literal_without_path_reaches_final_fallback(quote: str) -> None:
+    prefix = "// Deliverables： only\nconst u = "
+    text = prefix + quote + "//user=name@host：443?access_token=actual-secret;"
+    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": prefix + "REDACTED"}]
+
+
+def test_unsupported_network_authority_still_reaches_query_redaction() -> None:
+    text = r"//user\name@host：443?access_token=actual-secret"
+    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [
+        {"old_string": text.replace("actual-secret", "REDACTED")}
+    ]
+
+
+def test_unrecoverable_candidate_cannot_fall_through_as_safe(monkeypatch) -> None:
+    # Simulate a representation the precise query layer cannot recover.
+    monkeypatch.setattr(dashboard, "_redact_failed_uri_query", lambda *args, **kwargs: None)
+    for value in (
+        "//user=name@host：443?access_token=actual-secret",
+        '// Deliverables： only\nconst u = "//host：443?access_token=actual-secret";',
+        "// Deliverables： only\nconst u = `//host：443?access_token=actual-secret`;",
+    ):
+        output = dashboard.redact_dashboard_records([{"old_string": value}])[0]["old_string"]
+        assert "actual-secret" not in output
+        assert "REDACTED" in output
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "`//${host}/path?token=${`actual-secret`}`",
+        "`${base}?token=actual-secret`",
+        r"`${base}?tok\u0065n=${`actual-secret`}`",
+        "`https://${`host`}/path?token=actual-secret`",
+        "`${getBase(`prod`)}/path?token=actual-secret`",
+        "`${`https://host/path`}?token=actual-secret`",
+        "`${ready ? `https://host#fragment` : base}/path?token=actual-secret`",
+    ],
+)
+def test_dynamic_template_does_not_claim_a_static_literal_boundary(template: str) -> None:
+    text = "// Deliverables： only\nconst u = " + template + ";"
+    output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+    expected = (
+        "// Deliverables： only\nconst u = `REDACTED`;"
+        if template == "`${base}?token=actual-secret`"
+        else "// Deliverables： only\nconst u = REDACTED"
+    )
+    assert output == expected
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+@pytest.mark.parametrize(
+    "uri", ["//host：443 ?token=actual-secret", "//ho st：443?token=actual-secret", " //host：443?token=actual-secret"]
+)
+def test_literal_context_recovers_network_authority_spaces(quote: str, uri: str) -> None:
+    text = "// Deliverables： only\nconst u = " + quote + uri + quote + ";\nconst keep = 1;"
+    output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+    assert output == text.replace("actual-secret", "REDACTED")
+
+
+def test_trailing_authority_space_without_path_does_not_bypass_recovery() -> None:
+    uri = "//host：443 ?token=actual-secret"
+    assert dashboard.redact_dashboard_records([{"old_string": uri}]) == [
+        {"old_string": uri.replace("actual-secret", "REDACTED")}
+    ]
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+@pytest.mark.parametrize(
+    "uri",
+    [
+        " /path?token=actual-secret",
+        r"https\u003a\u002f\u002fhost?access_token=actual-secret",
+        r"https:\/\/host?token=actual-secret",
+    ],
+)
+def test_closed_and_unclosed_literals_share_candidate_discovery(quote: str, uri: str) -> None:
+    prefix = "// Deliverables： only\nconst u = "
+    for closing in [quote, ""]:
+        text = prefix + quote + uri + closing + ";"
+        output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+        assert "actual-secret" not in output
+        assert output.startswith(prefix)
+        if not closing:
+            assert output == prefix + "REDACTED"
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+def test_dangling_escape_does_not_hide_an_unclosed_candidate(quote: str) -> None:
+    prefix = "// Deliverables： only\nconst u = "
+    text = prefix + quote + r"https\u003a\u002f\u002fhost?access_token=actual-secret" + "\\"
+    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": prefix + "REDACTED"}]
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+@pytest.mark.parametrize("comment", ["// Don't： change", '// Say "hello：', "// Use `literal："])
+def test_rejected_comment_quotes_cannot_consume_later_uri_literals(quote: str, comment: str) -> None:
+    text = comment + "\nconst u = " + quote + "/path?token=actual-secret" + quote + ";\nconst keep = 1;"
+    output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+    assert output == text.replace("actual-secret", "REDACTED")
+
+
+@pytest.mark.parametrize("template", ['`${ready ? "ready" : "waiting"}`', "`Ready? ${name}`", "`${base}?public=keep`"])
+def test_templates_without_sensitive_queries_preserve_source(template: str) -> None:
+    text = "// Deliverables： only\nconst message = " + template + ";\nconst keep = 1;"
+    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": text}]
+
+
+@pytest.mark.parametrize(
+    "template", ["`Hello ${name}`", '`${ready ? "ready" : "waiting"}`', '`Hello ${{name: "}"}.name}`']
+)
+def test_bounded_templates_do_not_consume_later_source(template: str) -> None:
+    text = (
+        "// Deliverables： only\nconst label = " + template + ";\nconst result = ready ? token === expected : fallback;"
+    )
+    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": text}]
+
+
+@pytest.mark.parametrize("expression", ['"#".slice(1)', 'opts["#"]', "getBase(`host#fragment`)"])
+def test_dynamic_expression_fragment_cannot_hide_later_query_credentials(expression: str) -> None:
+    prefix = "// Deliverables： only\nconst u = "
+    text = prefix + "`https://host/path?public=${" + expression + "}&token=actual-secret`;\nconst keep = 1;"
+    output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+    assert "actual-secret" not in output
+    if "`" not in expression:
+        assert output == prefix + "`REDACTED`;\nconst keep = 1;"
+    else:
+        assert output == prefix + "REDACTED"
+
+
+def test_unparsed_regex_in_template_cannot_establish_a_false_boundary() -> None:
+    text = "// Deliverables： only\nconst u = `${/}/.test(x) ? `host` : base}/path?token=actual-secret`;"
+    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [
+        {"old_string": "// Deliverables： only\nconst u = REDACTED"}
+    ]
+
+
 @pytest.mark.parametrize(
     ("text", "secret", "expected_text"),
     [
+        ("//user=name@host：443?access_token=actual-secret", "actual-secret", None),
+        (
+            "// Deliverables： only\nconst u = `//host：443/path?access_token=actual-secret`;",
+            "actual-secret",
+            None,
+        ),
+        ("// Verify： ready? token === expected\nconst keep = 1;", None, None),
         ("// Deliverables： only\nconst result = ready ? token =~/expected/ : fallback;", None, None),
         ("https://host：443/path?token=actual-secret&label=public", "actual-secret", None),
         ("https://host：443/path?payload=client_secret%3Dactual-secret", "actual-secret", None),

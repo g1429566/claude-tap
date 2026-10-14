@@ -51,8 +51,11 @@ controls selected the record and expanded its strings. No image conversion,
 compositing, pixel processing or DOM content modification was performed.
 Both images were visually inspected and passed the screenshot checker.
 
-Regression tests additionally cover HTTP header context, Link targets,
-parameters and empty list members, URI context, surrounding and internal
-whitespace, nested credentials, control characters, JSON and lone surrogates.
+Regression tests cover normal redaction compatibility, failed URI authorities,
+userinfo delimiters with and without paths, static quoted and backtick URIs,
+nested query/form credentials, raw query controls, source-comment preservation
+and conservative handling of unsupported or unbounded candidates. HTTP tests
+check records and HTML responses while verifying that stored captures remain
+unchanged. Separate cache tests check the existing session-history behavior.
 Raw trace exports, database files, logs and credentials are excluded from this
 contribution.
