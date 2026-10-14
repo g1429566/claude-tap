@@ -1894,16 +1894,22 @@ def test_dashboard_retains_surrounding_uri_whitespace(leading: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("value", "expected"),
     [
-        "https://host/path?token=example-secret\n#keep",
-        "/allowed/.test(value)?token===expected:fallback\nconsole.log(result)\n",
-        "//note?token===expected:fallback\nconsole.log(result)\r\n",
-        "/allowed/.test(value)?\ntoken===expected:fallback\n",
+        ("https://host/path?token=example-secret\n#keep", "https://host/path?token=REDACTED#keep"),
+        (
+            "/allowed/.test(value)?token===expected:fallback\nconsole.log(result)\n",
+            "/allowed/.test(value)?token===expected:fallback\nconsole.log(result)\n",
+        ),
+        (
+            "//note?token===expected:fallback\nconsole.log(result)\r\n",
+            "//note?token===expected:fallback\nconsole.log(result)\r\n",
+        ),
+        ("/allowed/.test(value)?\ntoken===expected:fallback\n", "/allowed/.test(value)?\ntoken===expected:fallback\n"),
     ],
 )
-def test_dashboard_trims_only_surrounding_whitespace_for_uri_inference(value: str) -> None:
-    assert redact_dashboard_records([{"old_string": value}]) == [{"old_string": value}]
+def test_dashboard_keeps_source_inference_guard_and_absolute_uri_control_cleanup(value: str, expected: str) -> None:
+    assert redact_dashboard_records([{"old_string": value}]) == [{"old_string": expected}]
 
 
 @pytest.mark.parametrize("label", ["left%0Aright", "\ud800"])
