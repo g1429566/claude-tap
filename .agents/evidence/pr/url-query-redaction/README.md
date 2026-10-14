@@ -51,7 +51,8 @@ controls selected the record and expanded its strings. No image conversion,
 compositing, pixel processing or DOM content modification was performed.
 Both images were visually inspected and passed the screenshot checker.
 
-Regression tests additionally cover URI context, surrounding and internal
-whitespace, nested credentials, control characters, JSON and lone surrogates.
+Regression tests additionally cover HTTP header context, Link targets and
+parameters, URI context, surrounding and internal whitespace, nested credentials,
+control characters, JSON and lone surrogates.
 Raw trace exports, database files, logs and credentials are excluded from this
 contribution.

@@ -61,6 +61,15 @@ _SENSITIVE_KEY_NAMES = {
 _FORM_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-\[\]]{1,128}$")
 _URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _URL_LEADING_C0_OR_SPACE = "".join(chr(codepoint) for codepoint in range(33))
+_HTTP_TOKEN_PATTERN = r"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+_HTTP_QUOTED_PATTERN = r'"(?:\\[\s\S]|[^"\\])*"'
+_LINK_PARAMETER_PATTERN = rf"{_HTTP_TOKEN_PATTERN}(?:[ \t]*=[ \t]*(?:{_HTTP_QUOTED_PATTERN}|{_HTTP_TOKEN_PATTERN}))?"
+_LINK_VALUE_PATTERN = rf"<[^<>]*>(?:[ \t]*;[ \t]*{_LINK_PARAMETER_PATTERN})*"
+_LINK_HEADER_RE = re.compile(rf"[ \t]*{_LINK_VALUE_PATTERN}(?:[ \t]*,[ \t]*{_LINK_VALUE_PATTERN})*[ \t]*")
+_LINK_HEADER_PART_RE = re.compile(
+    rf"<(?P<target>[^<>]*)>|(?P<name>{_HTTP_TOKEN_PATTERN})"
+    rf"(?:(?P<assignment>[ \t]*=[ \t]*)(?P<value>{_HTTP_QUOTED_PATTERN}|{_HTTP_TOKEN_PATTERN}))?"
+)
 _MAX_TEXT_REDACTION_DEPTH = 8
 
 
@@ -920,21 +929,27 @@ def _preview_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [record for record in records if not _is_auxiliary_record(record) and not _is_protobuf_noise_record(record)]
 
 
-def _redact_sensitive_value(value: Any, key: str = "") -> Any:
+def _redact_sensitive_value(value: Any, key: str = "", *, header_context: bool = False) -> Any:
     if key and _is_sensitive_key(key):
         return None if value is None else _REDACTED_VALUE
+    header_context = header_context or re.sub(r"[^a-z0-9]", "", key.lower()) == "headers"
     if isinstance(value, dict):
         return {
-            str(item_key): _redact_sensitive_value(item_value, str(item_key)) for item_key, item_value in value.items()
+            str(item_key): _redact_sensitive_value(item_value, str(item_key), header_context=header_context)
+            for item_key, item_value in value.items()
         }
     if isinstance(value, list):
-        return [_redact_sensitive_value(item, key) for item in value]
+        return [_redact_sensitive_value(item, key, header_context=header_context) for item in value]
     if isinstance(value, str):
-        return _redact_sensitive_text(value, url_context=_is_url_or_path_key(key))
+        return _redact_sensitive_text(
+            value, url_context=header_context or _is_url_or_path_key(key), header_key=key if header_context else None
+        )
     return value
 
 
-def _redact_sensitive_text(value: str, depth: int = 0, *, url_context: bool = False) -> str:
+def _redact_sensitive_text(
+    value: str, depth: int = 0, *, url_context: bool = False, header_key: str | None = None
+) -> str:
     stripped = value.strip()
     if not stripped:
         return value
@@ -944,8 +959,16 @@ def _redact_sensitive_text(value: str, depth: int = 0, *, url_context: bool = Fa
         except json.JSONDecodeError:
             parsed = None
         if parsed is not None:
-            redacted = _redact_sensitive_value(parsed, "url" if url_context else "")
+            redacted = _redact_sensitive_value(
+                parsed,
+                header_key if header_key is not None else "url" if url_context else "",
+                header_context=header_key is not None,
+            )
             return value if redacted == parsed else json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
+    if header_key is not None and header_key.lower() == "link":
+        redacted_link = _redact_link_header(value, depth)
+        if redacted_link is not None:
+            return redacted_link
     redacted_url = _redact_url_query(value, depth, url_context=url_context)
     if redacted_url is not None:
         return redacted_url
@@ -957,7 +980,7 @@ def _redact_url_query(value: str, depth: int = 0, *, url_context: bool = False) 
     # Surrounding whitespace does not change a standalone URI's meaning.
     url_text = value if url_context else value.rstrip()
     trailing_whitespace = value[len(url_text) :]
-    before_fragment, fragment_separator, fragment = url_text.partition("#")
+    before_fragment = url_text.partition("#")[0]
     prefix, query_separator, query = before_fragment.partition("?")
     if not query_separator or not query or not _looks_like_url_or_path(prefix):
         return None
@@ -968,13 +991,65 @@ def _redact_url_query(value: str, depth: int = 0, *, url_context: bool = False) 
         any(char.isspace() for char in re.sub(r"^[\x00-\x20\s]+", "", prefix)) or any(char.isspace() for char in query)
     ):
         return None
-    # Check inference before cleanup so removing newlines cannot turn source into a URL.
+    redacted = _redact_uri_query(url_text, depth)
+    return None if redacted is None else redacted + trailing_whitespace
+
+
+def _redact_uri_query(value: str, depth: int = 0) -> str | None:
+    # This receives an established URI reference, including relative Link targets.
+    before_fragment, fragment_separator, fragment = value.partition("#")
+    prefix, query_separator, query = before_fragment.partition("?")
+    if not query_separator or not query:
+        return None
+    # Candidate inference happens before cleanup so removing newlines cannot turn source into a URL.
     # Retain URL query cleanup so raw controls cannot hide nested credential keys.
     query = query.replace("\t", "").replace("\r", "").replace("\n", "")
     redacted_query = _redact_query_string(query, depth)
     if redacted_query is None:
         return None
-    return f"{prefix}?{redacted_query}{fragment_separator}{fragment}{trailing_whitespace}"
+    return f"{prefix}?{redacted_query}{fragment_separator}{fragment}"
+
+
+def _redact_link_header(value: str, depth: int) -> str | None:
+    # A Link field contains URI references and parameters, rather than one URL.
+    # Quoted parameter values are consumed as a whole, so their '<' and ',' stay literal.
+    # Require the complete envelope; malformed fields retain permissive legacy redaction.
+    if not _LINK_HEADER_RE.fullmatch(value):
+        return None
+
+    def redact_part(match: re.Match[str]) -> str:
+        target = match.group("target")
+        if target is not None:
+            return f"<{_redact_uri_query(target, depth) or target}>"
+        name = match.group("name")
+        raw_value = match.group("value")
+        if raw_value is None:
+            return match.group(0)
+        quoted = raw_value.startswith('"')
+        parameter = re.sub(r"\\([\s\S])", r"\1", raw_value[1:-1]) if quoted else raw_value
+        if _is_sensitive_key(name):
+            redacted = _REDACTED_VALUE
+        elif name.lower() == "anchor" or _is_url_or_path_key(name):
+            redacted = _redact_uri_query(parameter, depth) or parameter
+        elif name.lower() in {"rel", "rev"}:
+            redacted = re.sub(
+                r"\S+",
+                lambda item: (
+                    (_redact_uri_query(item.group(0), depth) or item.group(0))
+                    if _URL_SCHEME_RE.match(item.group(0))
+                    else item.group(0)
+                ),
+                parameter,
+            )
+        else:
+            redacted = _redact_sensitive_text(parameter, depth)
+        if redacted == parameter:
+            return match.group(0)
+        if quoted:
+            redacted = '"' + redacted.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        return name + match.group("assignment") + redacted
+
+    return _LINK_HEADER_PART_RE.sub(redact_part, value)
 
 
 def _redact_form_text(value: str, depth: int = 0) -> str | None:
@@ -1033,7 +1108,7 @@ def _looks_like_form_key(key: str) -> bool:
 
 def _is_url_or_path_key(key: str) -> bool:
     normalized = re.sub(r"[^a-z0-9]", "", key.lower())
-    return normalized.endswith(("url", "uri", "path", "urls", "uris", "paths")) or normalized in {
+    return normalized.endswith(("url", "uri", "path", "urls", "uris", "paths", "href", "hrefs")) or normalized in {
         "location",
         "contentlocation",
         "destination",

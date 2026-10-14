@@ -4,7 +4,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 import aiohttp
 import pytest
@@ -1914,6 +1914,349 @@ def test_dashboard_redacts_surrounded_uri_with_encoded_whitespace_or_surrogate(l
     assert redact_dashboard_records([{"content": value}]) == [
         {"content": f"https://host/path?label={expected_label}&token=REDACTED\n"}
     ]
+
+
+@pytest.mark.parametrize("direction", ["request", "response"])
+@pytest.mark.parametrize("header_name", ["Link", "link", "LINK"])
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            '<https://host/path?access_token=actual-secret>; rel="next"',
+            '<https://host/path?access_token=REDACTED>; rel="next"',
+        ),
+        ("<//host/path?token=actual-secret>; rel=next", "<//host/path?token=REDACTED>; rel=next"),
+        ('<../next?token=actual-secret>; rel="next"', '<../next?token=REDACTED>; rel="next"'),
+        ('<next?token=actual-secret>; rel="next"', '<next?token=REDACTED>; rel="next"'),
+        ('<?token=actual-secret>; rel="next"', '<?token=REDACTED>; rel="next"'),
+        (
+            '<https://host\uff1a443/path?token=actual-secret>; rel="next"',
+            '<https://host\uff1a443/path?token=REDACTED>; rel="next"',
+        ),
+        ('<https://[broken/path?token=actual-secret>; rel="next"', '<https://[broken/path?token=REDACTED>; rel="next"'),
+        (
+            '<https://host/path?token=actual-secret#keep?cursor=1>; rel="next"',
+            '<https://host/path?token=REDACTED#keep?cursor=1>; rel="next"',
+        ),
+        (
+            '<https://host/first?token=first-secret>; rel="prev", <next?token=actual-secret>; rel="next"',
+            '<https://host/first?token=REDACTED>; rel="prev", <next?token=REDACTED>; rel="next"',
+        ),
+        (
+            '<https://host/first?cursor=1#keep>; rel="prev", <next?access_token=actual-secret>; rel="next"',
+            '<https://host/first?cursor=1#keep>; rel="prev", <next?access_token=REDACTED>; rel="next"',
+        ),
+        (
+            '<https://host/path?token=actual-secret>; title="comma, semicolon; angle <kept> and \\"quote\\""; rel="next"',
+            '<https://host/path?token=REDACTED>; title="comma, semicolon; angle <kept> and \\"quote\\""; rel="next"',
+        ),
+        (
+            '<https://host/path?redirect_uri=https%3A%2F%2Fnested%2Fcallback%3Faccess_token%3Dactual-secret>; rel="next"',
+            '<https://host/path?redirect_uri=https%3A%2F%2Fnested%2Fcallback%3Faccess_token%3DREDACTED>; rel="next"',
+        ),
+        (
+            '<next?payload=ready%3Ftoken%3D%3D%3Dexpected%3Afallback&access_token=actual-secret>; rel="next"',
+            '<next?payload=ready%3Ftoken%3D%3D%3Dexpected%3Afallback&access_token=REDACTED>; rel="next"',
+        ),
+        (
+            '<next?access%5Ftoken=actual-secret&cursor=1>; rel="next"',
+            '<next?access_token=REDACTED&cursor=1>; rel="next"',
+        ),
+        ('<next?access_\ttoken=actual-secret>; rel="next"', '<next?access_token=REDACTED>; rel="next"'),
+    ],
+    ids=[
+        "absolute",
+        "network-relative",
+        "parent-relative",
+        "single-segment-relative",
+        "query-only",
+        "nfkc-authority",
+        "unclosed-authority-bracket",
+        "fragment",
+        "multiple-secret-targets",
+        "later-target-after-fragment",
+        "quoted-delimiters",
+        "nested-encoded-credentials",
+        "encoded-source-with-secret",
+        "encoded-key",
+        "raw-control-key",
+    ],
+)
+def test_dashboard_redacts_link_header_targets_without_changing_syntax(
+    direction: str, header_name: str, value: str, expected: str
+) -> None:
+    record = {direction: {"headers": {header_name: value, "X-Request-Id": "public-id"}}}
+
+    assert redact_dashboard_records([record]) == [
+        {direction: {"headers": {header_name: expected, "X-Request-Id": "public-id"}}}
+    ]
+    assert record == {direction: {"headers": {header_name: value, "X-Request-Id": "public-id"}}}
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ('<next>; token=param-secret; rel="next"', '<next>; token=REDACTED; rel="next"'),
+        ('<next>; access_token="param-secret"; rel="next"', '<next>; access_token="REDACTED"; rel="next"'),
+        (
+            '<next>; access_token="param-secret; comma, \\"quote\\""; rel="next", <previous>; rel="prev"',
+            '<next>; access_token="REDACTED"; rel="next", <previous>; rel="prev"',
+        ),
+        ('<next>; X-Api-Key="param-secret"; title="public"', '<next>; X-Api-Key="REDACTED"; title="public"'),
+        (
+            '<next>; anchor="../context?token=anchor-secret#keep"; rel="next"',
+            '<next>; anchor="../context?token=REDACTED#keep"; rel="next"',
+        ),
+        ('<next>; anchor="?access_token=anchor-secret"', '<next>; anchor="?access_token=REDACTED"'),
+        (
+            '<next>; rel="next https://host/relation?token=relation-secret"; title="public"',
+            '<next>; rel="next https://host/relation?token=REDACTED"; title="public"',
+        ),
+        (
+            '<next>; rel="https://host/relation?token=relation-secret prev"',
+            '<next>; rel="https://host/relation?token=REDACTED prev"',
+        ),
+        (
+            '<https://host/path?token=target-secret>; rev="https://host/relation?access_token=relation-secret prev"',
+            '<https://host/path?token=REDACTED>; rev="https://host/relation?access_token=REDACTED prev"',
+        ),
+        (
+            '<next>; REV="prev https://host/relation?token=relation-secret#keep next"',
+            '<next>; REV="prev https://host/relation?token=REDACTED#keep next"',
+        ),
+        (
+            '<next>; alternate="https://host/path?token=extension-secret"; rel="next"',
+            '<next>; alternate="https://host/path?token=REDACTED"; rel="next"',
+        ),
+    ],
+    ids=[
+        "unquoted-secret",
+        "quoted-secret",
+        "quoted-secret-delimiters",
+        "normalized-secret",
+        "anchor-relative",
+        "anchor-query",
+        "rel-last",
+        "rel-first",
+        "rev-first",
+        "rev-middle-uppercase",
+        "extension-uri",
+    ],
+)
+def test_dashboard_redacts_link_header_parameters(value: str, expected: str) -> None:
+    record = {"response": {"headers": {"Link": value}}}
+
+    assert redact_dashboard_records([record]) == [{"response": {"headers": {"Link": expected}}}]
+    assert record == {"response": {"headers": {"Link": value}}}
+
+
+@pytest.mark.parametrize("name", ["href", "url", "redirect_uri", "callback_uri", "anchor"])
+def test_dashboard_redacts_bare_relative_uri_parameters_in_link_headers(name: str) -> None:
+    value = f'<next>; {name}="callback?access_token=param-secret#keep"; rel="next"'
+    expected = f'<next>; {name}="callback?access_token=REDACTED#keep"; rel="next"'
+    record = {"response": {"headers": {"Link": value}}}
+
+    assert redact_dashboard_records([record]) == [{"response": {"headers": {"Link": expected}}}]
+    assert record == {"response": {"headers": {"Link": value}}}
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            "<https://host/path>?payload=https%3A%2F%2Fhost%2Fpath%3Ftoken%3Dsentinel",
+            "<https://host/path>?payload=https%3A%2F%2Fhost%2Fpath%3Ftoken%3DREDACTED",
+        ),
+        (
+            '<https://host/path?payload=%3Faccess_token%3Dmalformed-secret>; rel="next" trailing',
+            "<https://host/path?payload=%3Faccess_token%3DREDACTED",
+        ),
+        (
+            'https://host/first?access_token=first-secret, <https://host/next?access_token=second-secret>; rel="next"',
+            "https://host/first?access_token=REDACTED",
+        ),
+    ],
+    ids=["encoded-payload-outside-target", "encoded-payload-after-invalid-envelope", "unbracketed-first-target"],
+)
+def test_dashboard_retains_legacy_redaction_for_malformed_link_headers(value: str, expected: str) -> None:
+    record = {"response": {"headers": {"Link": value}}}
+
+    assert redact_dashboard_records([record]) == [{"response": {"headers": {"Link": expected}}}]
+    assert record == {"response": {"headers": {"Link": value}}}
+
+
+def test_dashboard_preserves_valueless_parameters_while_redacting_link_headers() -> None:
+    value = '<next?token=actual-secret>; flag; rel="next", <previous>; another-flag'
+    expected = '<next?token=REDACTED>; flag; rel="next", <previous>; another-flag'
+    record = {"response": {"headers": {"Link": value}}}
+
+    assert redact_dashboard_records([record]) == [{"response": {"headers": {"Link": expected}}}]
+    assert record == {"response": {"headers": {"Link": value}}}
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "//note\nready?token===expected:fallback",
+        "/allowed/.test(value)? token === expected : fallback",
+        "This text mentions https://host/path?token=literal-example",
+    ],
+    ids=["multiline-source", "source-comparison", "literal-prose"],
+)
+def test_dashboard_preserves_ordinary_link_title_text(title: str) -> None:
+    value = f'<next>; title="{title}"; rel="next"'
+    record = {"response": {"headers": {"Link": value}}}
+
+    assert redact_dashboard_records([record]) == [record]
+
+
+def test_dashboard_redacts_standalone_uri_credentials_in_link_titles() -> None:
+    value = '<next>; title="https://host/path?access_token=title-secret#keep"; rel="next"'
+    expected = '<next>; title="https://host/path?access_token=REDACTED#keep"; rel="next"'
+    record = {"response": {"headers": {"Link": value}}}
+
+    assert redact_dashboard_records([record]) == [{"response": {"headers": {"Link": expected}}}]
+    assert record == {"response": {"headers": {"Link": value}}}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '<https://host/path?cursor=public#keep>; rel="next"; title="comma, semicolon; and <https://title/path?cursor=1>"',
+        '<next>; title="ready?token===expected:fallback"; rel="next"',
+        '<next>; title="escaped \\"quote\\" and <angles>"; rel="next", <previous>; rel="prev"',
+        '<https://host/path?payload=ready%3Ftoken%3D%3D%3Dexpected%3Afallback>; rel="next"',
+        '<next>; title="payload=ready%3Ftoken%3D%3D%3Dexpected%3Afallback"; rel="next"',
+    ],
+    ids=["public-query", "source-param", "escaped-quotes", "encoded-source-query", "encoded-source-param"],
+)
+def test_dashboard_preserves_link_headers_without_sensitive_values(value: str) -> None:
+    record = {"response": {"headers": {"Link": value}}, "old_string": "ready?token===expected:fallback"}
+
+    assert redact_dashboard_records([record]) == [record]
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("url", "https://host/path?code=ready%3Ftoken%3D%3D%3Dexpected%3Afallback"),
+        ("body", "code=ready%3Ftoken%3D%3D%3Dexpected%3Afallback"),
+    ],
+)
+def test_dashboard_preserves_encoded_source_values_in_urls_and_forms(key: str, value: str) -> None:
+    record = {key: value, "old_string": "ready?token===expected:fallback"}
+
+    assert redact_dashboard_records([record]) == [record]
+
+
+@pytest.mark.parametrize(
+    "shape", ["lists", "header-json-array", "headers-json-object", "body-json", "query-json", "form-json"]
+)
+def test_dashboard_retains_header_context_through_lists_and_json(shape: str) -> None:
+    value = '<https://host/path?access_token=actual-secret>; rel="next"'
+    expected = '<https://host/path?access_token=REDACTED>; rel="next"'
+    headers = {"lInK": value, "X-Public": "public-id"}
+    expected_headers = {"lInK": expected, "X-Public": "public-id"}
+    source = "ready?token===expected:fallback"
+    payload = {"response": {"HeAdErS": headers}, "old_string": source}
+    expected_payload = {"response": {"HeAdErS": expected_headers}, "old_string": source}
+
+    if shape == "lists":
+        record = {"request": {"HEADERS": {"Link": [[value]], "Authorization": ["header-secret"]}}}
+        redacted = redact_dashboard_records([record])[0]
+        assert redacted == {"request": {"HEADERS": {"Link": [[expected]], "Authorization": "REDACTED"}}}
+    elif shape == "header-json-array":
+        record = {"response": {"headers": {"Link": json.dumps([[value]])}}}
+        redacted = redact_dashboard_records([record])[0]
+        assert json.loads(redacted["response"]["headers"]["Link"]) == [[expected]]
+    elif shape == "headers-json-object":
+        record = {"response": {"HEADERS": json.dumps(headers)}}
+        redacted = redact_dashboard_records([record])[0]
+        assert json.loads(redacted["response"]["HEADERS"]) == expected_headers
+    elif shape == "body-json":
+        record = {"body": json.dumps(payload)}
+        redacted = redact_dashboard_records([record])[0]
+        assert json.loads(redacted["body"]) == expected_payload
+    else:
+        encoded = quote(json.dumps(payload, separators=(",", ":")), safe="")
+        key = "url" if shape == "query-json" else "body"
+        prefix = "https://host/path?" if shape == "query-json" else ""
+        record = {key: prefix + "payload=" + encoded}
+        redacted = redact_dashboard_records([record])[0]
+        query = redacted[key].partition("?")[2] if shape == "query-json" else redacted[key]
+        assert json.loads(parse_qs(query)["payload"][0]) == expected_payload
+
+    assert "actual-secret" not in json.dumps(redacted)
+    assert "actual-secret" in json.dumps(record)
+
+
+@pytest.mark.parametrize(
+    ("header_name", "value", "expected"),
+    [
+        (
+            "Content-Security-Policy",
+            "default-src 'self'; report-uri https://host/path?access_token=actual-secret",
+            "default-src 'self'; report-uri https://host/path?access_token=REDACTED",
+        ),
+        ("X-Next", "https://host/path?access_token=actual secret", "https://host/path?access_token=REDACTED"),
+        ("X-Next", "https://host/path?access_\ntoken=actual-secret", "https://host/path?access_token=REDACTED"),
+        (
+            "Report-To",
+            json.dumps({"endpoints": [{"url": "https://host/path?access_token=actual secret"}]}),
+            '{"endpoints":[{"url":"https://host/path?access_token=REDACTED"}]}',
+        ),
+    ],
+    ids=["csp", "custom-uri-header", "control-query-key", "structured-reporting"],
+)
+def test_dashboard_keeps_permissive_redaction_for_all_header_values(
+    header_name: str, value: str, expected: str
+) -> None:
+    source = "//note\nready?token===expected:fallback"
+    record = {"response": {"headers": {header_name: value}}, "old_string": source}
+
+    assert redact_dashboard_records([record]) == [
+        {"response": {"headers": {header_name: expected}}, "old_string": source}
+    ]
+    assert record == {"response": {"headers": {header_name: value}}, "old_string": source}
+
+
+@pytest.mark.parametrize("key", ["href", "hrefs", "HREF"])
+def test_dashboard_uses_href_uri_context_without_exempting_source_uris(key: str) -> None:
+    uri = "https://host/path?access_token=actual secret"
+    record = {key: [uri], "old_string": uri, "new_string": "https://host/path?access_token=standalone-secret"}
+
+    assert redact_dashboard_records([record]) == [
+        {
+            key: ["https://host/path?access_token=REDACTED"],
+            "old_string": uri,
+            "new_string": "https://host/path?access_token=REDACTED",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_session_records_redact_link_headers_without_mutating_capture(trace_db) -> None:
+    store = get_trace_store()
+    session_id = store.create_session(client="claude", proxy_mode="reverse")
+    record = _anthropic_record()
+    value = '<https://host/first?cursor=1#keep>; rel="prev", <next?access_token=actual-secret>; rel="next"'
+    expected = '<https://host/first?cursor=1#keep>; rel="prev", <next?access_token=REDACTED>; rel="next"'
+    record["request"]["headers"]["Link"] = value
+    record["response"]["headers"]["Link"] = value
+    record["request"]["body"]["messages"][0]["content"] = "ready?token===expected:fallback"
+    store.append_record(session_id, record)
+
+    server = LiveViewerServer(port=0, dashboard_mode=True)
+    request = make_mocked_request("GET", f"/api/sessions/{session_id}/records", match_info={"session_id": session_id})
+    response = await server._handle_session_records(request)
+    assert response.status == 200
+    payload = json.loads(response.text)
+
+    displayed = payload["records"][0]
+    assert displayed["request"]["headers"]["Link"] == displayed["response"]["headers"]["Link"] == expected
+    assert displayed["request"]["body"]["messages"][0]["content"] == "ready?token===expected:fallback"
+    assert "actual-secret" not in response.text
+    assert store.load_records(session_id) == [record]
 
 
 @pytest.mark.parametrize(
