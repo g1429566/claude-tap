@@ -1996,6 +1996,93 @@ def test_dashboard_redacts_link_header_targets_without_changing_syntax(
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
+        (
+            '<https://a?cursor=1>; rel="prev",, <https://b?access_token=actual-secret>; rel="next"',
+            '<https://a?cursor=1>; rel="prev",, <https://b?access_token=REDACTED>; rel="next"',
+        ),
+        (
+            ',\t <https://host/path?access_token=actual-secret>; rel="next"',
+            ',\t <https://host/path?access_token=REDACTED>; rel="next"',
+        ),
+        (
+            "<https://a?cursor=1>; rel=prev , \t ,\t <https://b?access_token=actual-secret>; rel=next",
+            "<https://a?cursor=1>; rel=prev , \t ,\t <https://b?access_token=REDACTED>; rel=next",
+        ),
+        (
+            '<https://host/path?access_token=actual-secret>; rel="next", \t',
+            '<https://host/path?access_token=REDACTED>; rel="next", \t',
+        ),
+        (
+            ',, \t<first?token=first-secret#keep>; rel="prev",,\t, <next?access_token=actual-secret>; rel="next",,',
+            ',, \t<first?token=REDACTED#keep>; rel="prev",,\t, <next?access_token=REDACTED>; rel="next",,',
+        ),
+        (
+            '<https://a?cursor=1#keep?token=fragment-text>; rel="prev",, <next?access_token=actual-secret>; rel="next"',
+            '<https://a?cursor=1#keep?token=fragment-text>; rel="prev",, <next?access_token=REDACTED>; rel="next"',
+        ),
+        (
+            '<https://a?labels=one,,two>; rel="prev",, <next?access_token=actual-secret&labels=three,,four>; rel="next"',
+            '<https://a?labels=one,,two>; rel="prev",, <next?access_token=REDACTED&labels=three%2C%2Cfour>; rel="next"',
+        ),
+        (
+            '<https://a?cursor=1>; title="comma,, semicolon; angle <kept>"; rel="prev",, '
+            '<next?access_token=actual-secret>; title="public,,text"; rel="next"',
+            '<https://a?cursor=1>; title="comma,, semicolon; angle <kept>"; rel="prev",, '
+            '<next?access_token=REDACTED>; title="public,,text"; rel="next"',
+        ),
+        (
+            ', \t<https://a?cursor=1#keep>; anchor="../context?access_token=anchor-secret#keep"; '
+            'rel="https://host/relation?token=relation-secret prev"; X-Api-Key = "parameter-secret",,\t'
+            '<next?access_token=actual-secret>; title="public,,text",\t',
+            ', \t<https://a?cursor=1#keep>; anchor="../context?access_token=REDACTED#keep"; '
+            'rel="https://host/relation?token=REDACTED prev"; X-Api-Key = "REDACTED",,\t'
+            '<next?access_token=REDACTED>; title="public,,text",\t',
+        ),
+        ("", ""),
+        (" \t", " \t"),
+        (",,", ",,"),
+        (" \t,\t, , \t", " \t,\t, , \t"),
+    ],
+    ids=[
+        "exact-double-comma-regression",
+        "leading-empty-with-tab",
+        "middle-empty-with-ows",
+        "trailing-empty-with-ows",
+        "multiple-empty-and-secret-targets",
+        "later-secret-after-first-fragment",
+        "target-query-commas",
+        "quoted-parameter-commas",
+        "uri-and-sensitive-parameters",
+        "empty",
+        "only-ows",
+        "only-commas",
+        "only-empty-members-with-ows",
+    ],
+)
+def test_dashboard_redacts_link_headers_with_empty_list_members(value: str, expected: str) -> None:
+    record = {
+        "request": {"headers": {"Link": value, "X-Public": "public-id"}},
+        "response": {"headers": {"Link": value, "X-Public": "public-id"}},
+        "old_string": "ready?token===expected:fallback",
+    }
+
+    assert redact_dashboard_records([record]) == [
+        {
+            "request": {"headers": {"Link": expected, "X-Public": "public-id"}},
+            "response": {"headers": {"Link": expected, "X-Public": "public-id"}},
+            "old_string": "ready?token===expected:fallback",
+        }
+    ]
+    assert record == {
+        "request": {"headers": {"Link": value, "X-Public": "public-id"}},
+        "response": {"headers": {"Link": value, "X-Public": "public-id"}},
+        "old_string": "ready?token===expected:fallback",
+    }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
         ('<next>; token=param-secret; rel="next"', '<next>; token=REDACTED; rel="next"'),
         ('<next>; access_token="param-secret"; rel="next"', '<next>; access_token="REDACTED"; rel="next"'),
         (
@@ -2050,6 +2137,42 @@ def test_dashboard_redacts_link_header_parameters(value: str, expected: str) -> 
     assert record == {"response": {"headers": {"Link": value}}}
 
 
+@pytest.mark.parametrize("name", ["rel", "rev"])
+@pytest.mark.parametrize("control", ["\t", "\r", "\n", "\r\n"], ids=["tab", "cr", "lf", "crlf"])
+def test_dashboard_redacts_raw_query_controls_in_link_relation_uris(name: str, control: str) -> None:
+    value = (
+        "<https://host/target?token=target-secret#target-fragment>; "
+        f'{name}="prev https://host/path?access_{control}token=relation-secret#keep next"; title="public"'
+    )
+    expected = (
+        "<https://host/target?token=REDACTED#target-fragment>; "
+        f'{name}="prev https://host/path?access_token=REDACTED#keep next"; title="public"'
+    )
+    record = {"response": {"headers": {"Link": value}}}
+
+    assert redact_dashboard_records([record]) == [{"response": {"headers": {"Link": expected}}}]
+    assert record == {"response": {"headers": {"Link": value}}}
+
+
+@pytest.mark.parametrize("name", ["rel", "rev"])
+@pytest.mark.parametrize(
+    "prefix", ["ht\ttps://host/path", "\x00\x1fht\ttps://host/path"], ids=["scheme-tab", "leading-c0"]
+)
+def test_dashboard_redacts_link_relation_uris_with_raw_scheme_controls(name: str, prefix: str) -> None:
+    value = (
+        "<https://host/target?token=target-secret#target-fragment>; "
+        f'{name}="prev {prefix}?token=relation-secret#keep next"; title="public"'
+    )
+    expected = (
+        "<https://host/target?token=REDACTED#target-fragment>; "
+        f'{name}="prev {prefix}?token=REDACTED#keep next"; title="public"'
+    )
+    record = {"response": {"headers": {"Link": value}}}
+
+    assert redact_dashboard_records([record]) == [{"response": {"headers": {"Link": expected}}}]
+    assert record == {"response": {"headers": {"Link": value}}}
+
+
 @pytest.mark.parametrize("name", ["href", "url", "redirect_uri", "callback_uri", "anchor"])
 def test_dashboard_redacts_bare_relative_uri_parameters_in_link_headers(name: str) -> None:
     value = f'<next>; {name}="callback?access_token=param-secret#keep"; rel="next"'
@@ -2075,8 +2198,22 @@ def test_dashboard_redacts_bare_relative_uri_parameters_in_link_headers(name: st
             'https://host/first?access_token=first-secret, <https://host/next?access_token=second-secret>; rel="next"',
             "https://host/first?access_token=REDACTED",
         ),
+        (
+            "<https://host/path?access_token=malformed-secret>,, trailing",
+            "<https://host/path?access_token=REDACTED",
+        ),
+        (
+            ', <https://host/path?access_token=malformed-secret>; title="unterminated,,',
+            ", <https://host/path?access_token=REDACTED",
+        ),
     ],
-    ids=["encoded-payload-outside-target", "encoded-payload-after-invalid-envelope", "unbracketed-first-target"],
+    ids=[
+        "encoded-payload-outside-target",
+        "encoded-payload-after-invalid-envelope",
+        "unbracketed-first-target",
+        "empty-members-before-invalid-trailing-text",
+        "empty-members-with-unclosed-quoted-parameter",
+    ],
 )
 def test_dashboard_retains_legacy_redaction_for_malformed_link_headers(value: str, expected: str) -> None:
     record = {"response": {"headers": {"Link": value}}}
@@ -2235,12 +2372,32 @@ def test_dashboard_uses_href_uri_context_without_exempting_source_uris(key: str)
 
 
 @pytest.mark.asyncio
-async def test_dashboard_session_records_redact_link_headers_without_mutating_capture(trace_db) -> None:
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            '<https://host/first?cursor=1#keep>; rel="prev", <next?access_token=actual-secret>; rel="next"',
+            '<https://host/first?cursor=1#keep>; rel="prev", <next?access_token=REDACTED>; rel="next"',
+        ),
+        (
+            '<https://a?cursor=1>; rel="prev",, <https://b?access_token=actual-secret>; rel="next"',
+            '<https://a?cursor=1>; rel="prev",, <https://b?access_token=REDACTED>; rel="next"',
+        ),
+        (
+            ',\t <https://a?cursor=1#keep>; rel="prev", \t, <next?access_token=actual-secret>; '
+            'anchor="../context?token=anchor-secret"; title="public,,text",\t',
+            ',\t <https://a?cursor=1#keep>; rel="prev", \t, <next?access_token=REDACTED>; '
+            'anchor="../context?token=REDACTED"; title="public,,text",\t',
+        ),
+    ],
+    ids=["populated-members", "double-comma-regression", "empty-members-with-ows-and-uri-parameter"],
+)
+async def test_dashboard_session_records_redact_link_headers_without_mutating_capture(
+    trace_db, value: str, expected: str
+) -> None:
     store = get_trace_store()
     session_id = store.create_session(client="claude", proxy_mode="reverse")
     record = _anthropic_record()
-    value = '<https://host/first?cursor=1#keep>; rel="prev", <next?access_token=actual-secret>; rel="next"'
-    expected = '<https://host/first?cursor=1#keep>; rel="prev", <next?access_token=REDACTED>; rel="next"'
     record["request"]["headers"]["Link"] = value
     record["response"]["headers"]["Link"] = value
     record["request"]["body"]["messages"][0]["content"] = "ready?token===expected:fallback"
@@ -2256,6 +2413,8 @@ async def test_dashboard_session_records_redact_link_headers_without_mutating_ca
     assert displayed["request"]["headers"]["Link"] == displayed["response"]["headers"]["Link"] == expected
     assert displayed["request"]["body"]["messages"][0]["content"] == "ready?token===expected:fallback"
     assert "actual-secret" not in response.text
+    assert "anchor-secret" not in response.text
+    assert record["request"]["headers"]["Link"] == record["response"]["headers"]["Link"] == value
     assert store.load_records(session_id) == [record]
 
 

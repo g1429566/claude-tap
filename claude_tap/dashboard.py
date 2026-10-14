@@ -65,7 +65,8 @@ _HTTP_TOKEN_PATTERN = r"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
 _HTTP_QUOTED_PATTERN = r'"(?:\\[\s\S]|[^"\\])*"'
 _LINK_PARAMETER_PATTERN = rf"{_HTTP_TOKEN_PATTERN}(?:[ \t]*=[ \t]*(?:{_HTTP_QUOTED_PATTERN}|{_HTTP_TOKEN_PATTERN}))?"
 _LINK_VALUE_PATTERN = rf"<[^<>]*>(?:[ \t]*;[ \t]*{_LINK_PARAMETER_PATTERN})*"
-_LINK_HEADER_RE = re.compile(rf"[ \t]*{_LINK_VALUE_PATTERN}(?:[ \t]*,[ \t]*{_LINK_VALUE_PATTERN})*[ \t]*")
+# HTTP lists permit empty members; preserve their separators while redacting nonempty values.
+_LINK_HEADER_RE = re.compile(rf"[ \t,]*{_LINK_VALUE_PATTERN}(?:[ \t]*,[ \t,]*{_LINK_VALUE_PATTERN})*[ \t,]*")
 _LINK_HEADER_PART_RE = re.compile(
     rf"<(?P<target>[^<>]*)>|(?P<name>{_HTTP_TOKEN_PATTERN})"
     rf"(?:(?P<assignment>[ \t]*=[ \t]*)(?P<value>{_HTTP_QUOTED_PATTERN}|{_HTTP_TOKEN_PATTERN}))?"
@@ -1032,11 +1033,12 @@ def _redact_link_header(value: str, depth: int) -> str | None:
         elif name.lower() == "anchor" or _is_url_or_path_key(name):
             redacted = _redact_uri_query(parameter, depth) or parameter
         elif name.lower() in {"rel", "rev"}:
+            # Relation lists use SP separators; URI query controls must reach cleanup.
             redacted = re.sub(
-                r"\S+",
+                r"[^ ]+",
                 lambda item: (
                     (_redact_uri_query(item.group(0), depth) or item.group(0))
-                    if _URL_SCHEME_RE.match(item.group(0))
+                    if _URL_SCHEME_RE.match(_url_candidate_prefix(item.group(0)))
                     else item.group(0)
                 ),
                 parameter,
@@ -1090,7 +1092,7 @@ def _redact_query_string(query: str, depth: int = 0) -> str | None:
 
 def _looks_like_url_or_path(prefix: str) -> bool:
     # Match the parser's candidate cleanup without changing the original text.
-    candidate = prefix.lstrip(_URL_LEADING_C0_OR_SPACE).replace("\t", "").replace("\r", "").replace("\n", "")
+    candidate = _url_candidate_prefix(prefix)
     # Keep query-only and root-path checks anchored to the original prefix.
     if not prefix or _URL_SCHEME_RE.match(candidate) or prefix.startswith("/"):
         return True
@@ -1100,6 +1102,10 @@ def _looks_like_url_or_path(prefix: str) -> bool:
             return True
         candidate = separator + path
     return "/" in candidate and "=" not in candidate
+
+
+def _url_candidate_prefix(value: str) -> str:
+    return value.lstrip(_URL_LEADING_C0_OR_SPACE).replace("\t", "").replace("\r", "").replace("\n", "")
 
 
 def _looks_like_form_key(key: str) -> bool:
