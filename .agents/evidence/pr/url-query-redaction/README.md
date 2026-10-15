@@ -1,61 +1,45 @@
 # URL query redaction regression evidence
 
-These original browser screenshots use one complete two-user-turn Claude Code
-conversation captured through the local claude-tap proxy on 2026-10-14
-(Asia/Shanghai). The capture used the documented tmux interactive flow,
-without `-p` or `--print`, and the configured DeepSeek Anthropic backend with
-model `deepseek-flash`.
+## Reproduction and behavior
 
-The first prompt starts with the regression snippet, then asks Claude Code to
-read `sample.js`. The second prompt requests an Edit using the complete snippet
-as `old_string`, including its trailing newline. Real tool calls were
-Read, Edit and Read; the edit changed only the comment from `only` to `verified`.
-Both user turns completed successfully.
-
-The session contains six real `/v1/messages?beta=true` requests, all HTTP 200,
-including Claude Code's session-title request. Their combined usage is 2,379
-input tokens, 438 output tokens and 3,456 cache-read tokens. The viewer's
-2,817 cumulative API-token total counts input plus output; its six entries
-represent recorded API requests, rather than six user turns.
-
-The actual Edit `old_string` is:
+This captured Edit input makes `urlsplit()` interpret the comment as an
+invalid authority and raise an NFKC-related `ValueError`:
 
 ```javascript
 // Deliverables： only
 const result = ready ? token === expected : fallback;
 ```
 
-A trailing newline follows the second line. The prompts and isolated sample
-file were written for this regression check.
+The records and HTML handlers return HTTP 200, with this display field set to
+`REDACTED`. Simple malformed authorities reuse existing query redaction;
+uncertain failed fields are hidden. Stored captures and raw exports are unchanged.
 
-Before/after HTTP checks used separate servers and SQLite backups containing
-the same six captured records. The records and HTML viewer endpoints both
-return HTTP 500 before the fix, with the server traceback containing an NFKC
-`ValueError` from CPython's `_checknetloc()`. Both endpoints return HTTP 200
-after the fix; the actual Edit strings and captured prompt are preserved.
-The original model responses are HTTP 200 throughout.
+## Validation
 
-- `trace-viewer-multiturn-fixed.png` directly captures the actual fixed viewer,
-  selecting the Edit-producing record and expanding its escaped input strings.
-  The sidebar shows all six requests and the header shows nonzero token usage.
-- `trace-viewer-multiturn-baseline-network.png` directly captures Chromium's
-  native DevTools Network Headers for a real GET of the original server's
-  records endpoint. The underlying `/dashboard` page returned HTTP 200; the
-  records request returned HTTP 500. The panel shows the complete session URL,
-  GET method, status 500 and dashboard referrer.
+```bash
+python -m pytest tests/ -q -x --timeout=60
+ruff check .
+ruff format --check .
+git diff --check
+```
 
-Both images are direct lossless PNG browser captures at a 1280x900 CSS viewport
-and 2x device scale (2560x1800 image pixels). Playwright captured the viewer;
-Playwright CDP captured the native undocked DevTools frontend. Browser UI
-controls selected the record and expanded its strings. No image conversion,
-compositing, pixel processing or DOM content modification was performed.
-Both images were visually inspected and passed the screenshot checker.
+Python 3.13 with Chromium: **1,592 passed, 26 skipped**; lint, formatting, and diff
+checks pass. Skips cover 18 tests requiring local trace files, seven opt-in CLI
+E2E tests, and one Windows test. Regressions verify normal redaction, authority
+boundaries, records/HTML responses, masking, and unchanged stored and export data.
 
-Regression tests cover normal redaction compatibility, failed URI authorities,
-userinfo delimiters with and without paths, static quoted and backtick URIs,
-nested query/form credentials, raw query controls, source-comment preservation
-and conservative handling of unsupported or unbounded candidates. HTTP tests
-check records and HTML responses while verifying that stored captures remain
-unchanged. Separate cache tests check the existing session-history behavior.
-Raw trace exports, database files, logs and credentials are excluded from this
-contribution.
+## Screenshots
+
+Current screenshots use local headless Chromium on macOS at 1280x900 CSS pixels
+and 2x scale. Both viewer pages and records endpoints return HTTP 200.
+
+- `trace-viewer-query-redacted-demo.png`: demonstration fixture, with no model
+  call. Only the fake token is hidden; the public parameter and URL structure remain.
+- `trace-viewer-source-redacted-current.png`: the original real two-user-turn
+  Claude Code session, captured through the local proxy using tmux with DeepSeek
+  `deepseek-flash`. Edit fields show `REDACTED`; the filename and session remain visible.
+- `trace-viewer-multiturn-baseline-network.png`: native Chromium Network Headers
+  show the records GET returning HTTP 500, documenting the original failure.
+
+The original `trace-viewer-multiturn-fixed.png` is retained as a historical
+capture of complete Edit source, not current masking evidence.

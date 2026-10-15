@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from claude_tap.bedrock import bedrock_model_from_path
@@ -59,19 +60,10 @@ _SENSITIVE_KEY_NAMES = {
     "xapikey",
 }
 _FORM_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-\[\]]{1,128}$")
-_FAILED_URI_PREFIX = (
-    r"(?:(?:[A-Za-z][A-Za-z0-9+.-]*:)?//[^\r\n/?#\"`\\]+(?:/[^\s?#\"`\\]*)?"
-    r"|[A-Za-z][A-Za-z0-9+.-]*:[^\s?#\"`\\]*"
-    r"|(?:/(?!/)|[A-Za-z0-9_.-]+/)[^\s?#\"`\\]*|)"
-)
-_FAILED_URI_PREFIX_RE = re.compile(_FAILED_URI_PREFIX)
-_FAILED_URI_LITERAL_RE = re.compile(
-    r"""(?P<quote>["'`])(?P<uri>(?:\\(?:[\s\S]|$)|(?!(?P=quote))[^\\])*)(?:(?P<closed>(?P=quote))|$)"""
-)
-# Discover unbounded candidates without requiring a valid authority or a path.
-# Closed and unclosed literals share one scanner; only bare URIs remain here.
-_UNBOUNDED_URI_RE = re.compile(r"""[A-Za-z][A-Za-z0-9+.-]*:(?://|\\/\\/)|//""")
 _MAX_TEXT_REDACTION_DEPTH = 8
+_FAILED_URI_AUTHORITY_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*:)?//")
+_URL_LEADING_CONTROLS = "".join(map(chr, range(33)))
+_REDACTION_AUTHORITY = "redaction.invalid"
 
 
 def read_dashboard_template() -> str:
@@ -980,182 +972,42 @@ def _redact_url_query(value: str, depth: int = 0) -> str | None:
 
 
 def _redact_failed_url_text(value: str, depth: int) -> str:
-    """Resolve each discovered URI or mask it before returning captured text."""
-    prefix = value.partition("?")[0]
-    kind = _classify_failed_uri_prefix(prefix)
-    if kind != "source":
-        redacted = _redact_failed_uri_query(value, depth, uncertain=kind == "uncertain")
-        # None means this candidate could not be safely recovered, not that it
-        # is safe to expose. Never send it through another recognition gate.
-        if redacted is None:
-            return prefix + "?" + _REDACTED_VALUE if kind == "uncertain" else _REDACTED_VALUE
-        return redacted
-
-    replacements: list[tuple[int, int, str]] = []
-    remaining = list(value)
-    literal_offset = 0
-    while match := _FAILED_URI_LITERAL_RE.search(value, literal_offset):
-        # A rejected quote may be an apostrophe in prose/comments. Do not let
-        # it consume later real literals that the recovery layer must inspect.
-        literal_offset = match.start() + 1
-        uri = match.group("uri")
-        quote = match.group("quote")
-        kind = _classify_failed_uri_prefix(uri.partition("?")[0], literal=True)
-        dynamic = quote == "`" and "${" in uri
-        if dynamic:
-            bounded = bool(match.group("closed")) and _template_literal_is_bounded(uri)
-            inspected = uri if bounded else value[match.start() :]
-            # A # inside an interpolation is source, not a known URI fragment
-            # boundary. Inspect the whole query candidate until JS is resolved.
-            sensitive = any(
-                _failed_query_needs_redaction(query, depth, dynamic=True) for query in inspected.split("?")[1:]
-            )
-            if sensitive and not bounded:
-                replacements.append((match.start(), len(value), _REDACTED_VALUE))
-                break
-            replacement = _REDACTED_VALUE if sensitive else uri
-        elif kind != "source":
-            replacement = (
-                _redact_failed_uri_query(uri, depth, uncertain=kind == "uncertain", quoted=True)
-                if match.group("closed")
-                else None
-            )
-            if replacement is None:
-                replacements.append((match.start(), len(value), _REDACTED_VALUE))
-                break
-        else:
-            if "\\" not in uri or "?" not in uri:
-                continue
-            query = uri.partition("?")[2].partition("#")[0]
-            try:
-                if "\\" not in query and not (
-                    _may_contain_sensitive_text(query) or _redact_query_string(query, depth) is not None
-                ):
-                    continue
-            except UnicodeError:
-                pass
-            # Escaped source needs a language decoder; hide the known literal
-            # rather than treating an unsupported representation as harmless.
-            replacement = _REDACTED_VALUE
-        if not match.group("closed"):
-            replacements.append((match.start(), len(value), _REDACTED_VALUE))
-            break
-        replacements.append((match.start(), match.end(), quote + replacement + quote))
-        remaining[match.start() : match.end()] = " " * (match.end() - match.start())
-        literal_offset = match.end()
-
-    for match in _UNBOUNDED_URI_RE.finditer("".join(remaining)):
-        candidate = value[match.start() :]
-        prefix, separator, query = candidate.partition("?")
-        # A raw-space // comment is source, not an unresolved network URI.
-        if candidate.startswith("//") and _classify_failed_uri_prefix(prefix) == "source":
-            continue
-        sensitive = _failed_query_needs_redaction(query, depth)
-        if sensitive or (separator and "\\" in candidate):
-            replacements.append((match.start(), len(value), _REDACTED_VALUE))
-            break
-    parts: list[str] = []
-    end = 0
-    for start, stop, replacement in sorted(replacements):
-        if start >= end:
-            parts.extend((value[end:start], replacement))
-            end = stop
-    parts.append(value[end:])
-    return "".join(parts)
-
-
-def _template_literal_is_bounded(value: str) -> bool:
-    """Confirm simple interpolation boundaries; unsupported JS stays uncertain."""
-    offset = 0
-    depth = 0
-    while offset < len(value):
-        char = value[offset]
-        if not depth:
-            if char == "\\":
-                offset += 2
-                continue
-            if value.startswith("${", offset):
-                depth = 1
-                offset += 2
-                continue
-        elif char in {"'", '"'}:
-            quoted = _FAILED_URI_LITERAL_RE.match(value, offset)
-            if quoted is None or not quoted.group("closed"):
-                return False
-            offset = quoted.end()
-            continue
-        elif char in {"/", "`", "\\"}:
-            # Regex literals, comments and nested templates need a JS parser.
-            return False
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-        offset += 1
-    return depth == 0
-
-
-def _failed_query_needs_redaction(query: str, depth: int, *, dynamic: bool = False) -> bool:
-    if not dynamic:
-        query = query.partition("#")[0]
-    query = query.replace("\t", "").replace("\r", "").replace("\n", "")
+    """Repair a simple URI authority, or hide the uncertain failed field."""
+    raw = value.lstrip(_URL_LEADING_CONTROLS)
+    before_fragment, _, fragment = raw.partition("#")
+    prefix = before_fragment.partition("?")[0]
+    # Check raw source boundaries before control cleanup could join lines.
+    if (
+        any(char.isspace() for char in prefix + fragment)
+        or any(char in prefix + fragment for char in "\\\"'`{}<>")
+        or "?" in fragment
+    ):
+        return _REDACTED_VALUE
+    view = raw.replace("\t", "").replace("\r", "").replace("\n", "")
+    opening = _FAILED_URI_AUTHORITY_RE.match(view)
+    if opening is None:
+        return _REDACTED_VALUE
+    start = opening.end()
+    end = min((i for char in "/?#" if (i := view.find(char, start)) >= 0), default=len(view))
+    authority = view[start:end]
+    # Recovery only owns a whole, bounded URI. Source-like prefixes never
+    # enter another discovery/parser path after authority parsing has failed.
+    if not authority:
+        return _REDACTED_VALUE
+    normalized = unicodedata.normalize("NFKC", authority)
+    if any(char in normalized for char in "/?#") or normalized.count("@") != authority.count("@"):
+        return _REDACTED_VALUE
+    repaired = view[:start] + _REDACTION_AUTHORITY + view[end:]
     try:
-        return bool(
-            query
-            and ("\\" in query or _may_contain_sensitive_text(query) or _redact_query_string(query, depth) is not None)
-        )
-    except UnicodeError:
-        return True
-
-
-def _classify_failed_uri_prefix(prefix: str, *, literal: bool = False) -> Literal["source", "uri", "uncertain"]:
-    cleaned_prefix = prefix.lstrip("".join(map(chr, range(33)))).replace("\t", "").replace("\r", "").replace("\n", "")
-    matches_uri = bool(_FAILED_URI_PREFIX_RE.fullmatch(cleaned_prefix))
-    if cleaned_prefix.startswith("//"):
-        authority, path_separator, _path = cleaned_prefix[2:].partition("/")
-        if any(char.isspace() for char in authority):
-            # A network reference inside a literal is not a source comment.
-            if literal and authority and not authority[0].isspace():
-                return "uncertain"
-            # Leading/internal spaces indicate a bare source comment. A
-            # trailing space after a single authority token remains uncertain.
-            if not authority.rstrip() or any(char.isspace() for char in authority.rstrip()):
-                return "source"
-            return "uncertain"
-        if not matches_uri or (("\r" in prefix or "\n" in prefix) and not path_separator):
-            return "uncertain"
-    elif not matches_uri:
-        return "source"
-    return "uri"
-
-
-def _redact_failed_uri_query(value: str, depth: int, *, uncertain: bool = False, quoted: bool = False) -> str | None:
-    """Recover an already classified candidate; None requires caller masking."""
-    before_fragment, fragment_separator, fragment = value.partition("#")
-    prefix, query_separator, query = before_fragment.partition("?")
-    if not query_separator or not query:
+        parsed = urlsplit(repaired)
+        redacted_query = _redact_query_string(parsed.query, depth)
+    except (ValueError, RecursionError):
+        return _REDACTED_VALUE
+    if redacted_query is None:
         return value
-    if "\\" in query:
-        return prefix + "?" + _REDACTED_VALUE if uncertain else _REDACTED_VALUE
-    if quoted and ("\r" in query or "\n" in query) and (";" in query or " " in query):
-        # A later source quote must not silently become this URI's delimiter.
-        return None
-    query = query.replace("\t", "").replace("\r", "").replace("\n", "")
-    for key, item in parse_qsl(query, keep_blank_values=True):
-        if not _is_sensitive_key(key) and item.lstrip().startswith(("'", '"')) and _may_contain_sensitive_text(item):
-            return prefix + "?" + _REDACTED_VALUE if uncertain else _REDACTED_VALUE
-        if not _is_sensitive_key(key) and item.lstrip().startswith(("{", "[")):
-            try:
-                json.loads(item)
-            except json.JSONDecodeError:
-                return None
-    try:
-        redacted_query = _redact_query_string(query, depth)
-    except UnicodeError:
-        return prefix + "?" + _REDACTED_VALUE if uncertain else _REDACTED_VALUE
-    if redacted_query is None and uncertain and _may_contain_sensitive_text(query):
-        return prefix + "?" + _REDACTED_VALUE
-    return value if redacted_query is None else prefix + "?" + redacted_query + fragment_separator + fragment
+    # Restore only the authority component. Neither an old query nor another
+    # occurrence of the placeholder can be substituted back into the output.
+    return urlunsplit((parsed.scheme, authority, parsed.path, redacted_query, parsed.fragment))
 
 
 def _redact_form_text(value: str, depth: int = 0) -> str | None:

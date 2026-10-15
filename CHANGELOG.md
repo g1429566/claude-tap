@@ -9,10 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Fix session records and HTML viewer failures when captured text triggers URL authority validation errors.
-  Keep normal redaction behavior and reuse existing query/form rules during exception recovery.
-  Preserve source comments and recover standalone or quoted URI queries, including network references without paths
-  and static backtick literals; conservatively hide candidates that cannot be safely recovered.
+- Fix session records and HTML viewer HTTP 500 errors caused by URL authority parsing of captured text.
 
 - Ignore object key order in viewer parameter diffs and sort displayed JSON to highlight actual value changes.
 
