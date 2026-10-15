@@ -1,6 +1,7 @@
-"""Shared redaction contracts for normal and repaired URI authorities."""
+"""Successful parsing stays compatible; failed parsing hides the current string."""
 
 import json
+from copy import deepcopy
 from itertools import product
 from urllib.parse import quote_plus
 
@@ -10,6 +11,15 @@ import pytest
 from claude_tap import dashboard
 from claude_tap.live import LiveViewerServer
 from claude_tap.trace_store import get_trace_store
+
+
+def redact_records_for_display(records: list[dict]) -> list[dict]:
+    """Exercise low-level recovery only within an explicit display scope."""
+    saved = deepcopy(records)
+    with dashboard.dashboard_redaction_scope():
+        result = dashboard.redact_dashboard_records(records)
+    assert records == saved
+    return result
 
 
 @pytest.mark.parametrize(
@@ -36,9 +46,6 @@ from claude_tap.trace_store import get_trace_store
     ],
 )
 def test_normal_redaction_retains_original_outputs_without_recovery(monkeypatch, value: str, expected: str) -> None:
-    def unexpected_recovery(*args):
-        pytest.fail("Successful URL parsing must not invoke exception recovery")
-
     original_urlsplit = dashboard.urlsplit
     parsed_values = []
 
@@ -47,15 +54,14 @@ def test_normal_redaction_retains_original_outputs_without_recovery(monkeypatch,
         return original_urlsplit(value, *args, **kwargs)
 
     monkeypatch.setattr(dashboard, "urlsplit", observed_urlsplit)
-    monkeypatch.setattr(dashboard, "_redact_failed_url_text", unexpected_recovery)
     record = {"content": value}
     assert dashboard.redact_dashboard_records([record]) == [{"content": expected}]
-    assert not any(dashboard._REDACTION_AUTHORITY in candidate for candidate in parsed_values)
+    assert all(candidate in value for candidate in parsed_values)
     assert record == {"content": value}
 
 
 @pytest.mark.parametrize("authority", ["https://host", "https://host：443", "https://[broken"])
-def test_normal_and_repaired_authorities_delegate_to_the_same_query_core_once(monkeypatch, authority: str) -> None:
+def test_only_successful_authorities_delegate_to_the_original_query_core(monkeypatch, authority: str) -> None:
     original_query_core = dashboard._redact_query_string
     queries = []
 
@@ -66,10 +72,9 @@ def test_normal_and_repaired_authorities_delegate_to_the_same_query_core_once(mo
     monkeypatch.setattr(dashboard, "_redact_query_string", observed_query_core)
     query = "token=actual-secret&public=keep"
     value = authority + "/path?" + query
-    assert dashboard.redact_dashboard_records([{"content": value}]) == [
-        {"content": authority + "/path?token=REDACTED&public=keep"}
-    ]
-    assert queries == [query]
+    expected = authority + "/path?token=REDACTED&public=keep" if authority == "https://host" else "REDACTED"
+    assert redact_records_for_display([{"content": value}]) == [{"content": expected}]
+    assert queries == ([query] if authority == "https://host" else [])
 
 
 def test_original_comment_failure_hides_field_without_reparsing_source(monkeypatch) -> None:
@@ -82,14 +87,14 @@ def test_original_comment_failure_hides_field_without_reparsing_source(monkeypat
 
     monkeypatch.setattr(dashboard, "urlsplit", observed_urlsplit)
     text = "// Deliverables： only\nconst result = ready ? token === expected : fallback;\n"
-    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([{"old_string": text}]) == [{"old_string": "REDACTED"}]
     assert parsed_values == [text]
 
 
 @pytest.mark.parametrize("authority", ["https://host：443", "https://[broken", "//host：443"])
-def test_public_malformed_whole_uri_keeps_its_exact_bytes(authority: str) -> None:
+def test_public_malformed_whole_uri_hides_the_failed_leaf(authority: str) -> None:
     text = authority + "/path%2fpart?label=one%20two&flag#section"
-    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": text}]
+    assert redact_records_for_display([{"old_string": text}]) == [{"old_string": "REDACTED"}]
 
 
 @pytest.mark.parametrize(
@@ -98,17 +103,15 @@ def test_public_malformed_whole_uri_keeps_its_exact_bytes(authority: str) -> Non
 @pytest.mark.parametrize("comment", ["// Deliverables： only", "//Deliverables： only", "//note："])
 def test_failed_source_parse_does_not_run_assignment_grammar(expression: str, comment: str) -> None:
     text = f"{comment}\nconst result = ready ? {expression} : fallback;"
-    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([{"old_string": text}]) == [{"old_string": "REDACTED"}]
 
 
 @pytest.mark.parametrize("authority", ["https://host：443", "https://[broken", "//host：443"])
 @pytest.mark.parametrize("credential", ["actual-secret", "==actual-secret", "~actual-secret"])
-def test_failed_uri_authorities_reuse_sensitive_query_rules(authority: str, credential: str) -> None:
+def test_failed_uri_authorities_hide_all_components(authority: str, credential: str) -> None:
     value = f"{authority}/path?token={credential}&label=public#keep"
     record = {"content": value}
-    assert dashboard.redact_dashboard_records([record]) == [
-        {"content": f"{authority}/path?token=REDACTED&label=public#keep"}
-    ]
+    assert redact_records_for_display([record]) == [{"content": "REDACTED"}]
     assert record == {"content": value}
 
 
@@ -125,12 +128,14 @@ def test_failed_uri_authorities_reuse_sensitive_query_rules(authority: str, cred
         ("%74oken=actual-secret&label=public", "token=REDACTED&label=public"),
     ],
 )
-def test_failed_uri_nested_values_use_original_query_and_field_rules(query: str, expected: str) -> None:
+def test_failed_uri_nested_query_inputs_hide_the_failed_leaf(query: str, expected: str) -> None:
     value = "https://host：443/path?" + query + "#keep"
     record = {"content": value}
-    expected_text = "https://host：443/path?" + expected + "#keep"
-    assert dashboard.redact_dashboard_records([record]) == [{"content": expected_text}]
-    assert "actual-secret" not in expected_text
+    assert redact_records_for_display([record]) == [{"content": "REDACTED"}]
+    normal = "https://host/path?" + query + "#keep"
+    assert dashboard.redact_dashboard_records([{"content": normal}]) == [
+        {"content": "https://host/path?" + expected + "#keep"}
+    ]
     assert record["content"] == value
 
 
@@ -148,11 +153,11 @@ def test_failed_uri_nested_values_use_original_query_and_field_rules(query: str,
     ],
 )
 @pytest.mark.parametrize("value", ["==actual-secret", "~actual-secret"])
-def test_simple_quoted_uris_keep_surrounding_source(quote: str, uri: str, value: str) -> None:
+def test_source_with_quoted_uris_hides_the_failed_string(quote: str, uri: str, value: str) -> None:
     prefix = "// Deliverables： only\nconst uri = "
     suffix = ";\nconst untouched = ready ? token =~/expected/ : fallback;"
     text = prefix + quote + uri + "?token=" + value + "&label=public#keep" + quote + suffix
-    result = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+    result = redact_records_for_display([{"old_string": text}])[0]["old_string"]
     assert "actual-secret" not in result
     assert result == "REDACTED"
 
@@ -170,11 +175,11 @@ def test_simple_quoted_uris_keep_surrounding_source(quote: str, uri: str, value:
         (r'"https:\/\/host：443/path?token=actual-secret";', "REDACTED"),
     ],
 )
-def test_final_fallback_hides_only_bounded_literal_or_uncertain_tail(literal: str, expected: str) -> None:
+def test_failed_source_literal_inputs_hide_the_current_string(literal: str, expected: str) -> None:
     prefix = "// Deliverables： only\nconst uri = "
     text = prefix + literal
     record = {"old_string": text}
-    assert dashboard.redact_dashboard_records([record]) == [{"old_string": expected}]
+    assert redact_records_for_display([record]) == [{"old_string": expected}]
     assert record == {"old_string": text}
 
 
@@ -182,21 +187,21 @@ def test_final_fallback_hides_only_bounded_literal_or_uncertain_tail(literal: st
 @pytest.mark.parametrize(
     "query", ["access_{control}token=actual-secret", "payload=client_se{control}cret=actual-secret"]
 )
-def test_second_layer_cleans_quoted_query_controls_without_hiding_source(control: str, query: str) -> None:
+def test_failed_source_with_quoted_query_controls_hides_the_current_string(control: str, query: str) -> None:
     prefix = "// Deliverables： only\nconst uri = "
     suffix = ";\nconst keep = ready ? token =~/expected/ : fallback;"
     text = prefix + '"https://host：443/path?' + query.format(control=control) + '"' + suffix
     record = {"old_string": text}
-    assert dashboard.redact_dashboard_records([record]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([record]) == [{"old_string": "REDACTED"}]
     assert record == {"old_string": text}
 
 
-def test_second_layer_reuses_original_nested_json_redactor_in_bounded_literal() -> None:
+def test_failed_source_with_nested_json_hides_the_current_string() -> None:
     prefix = "// Deliverables： only\nconst uri = 'https://host：443/path?"
     suffix = "';\nconst keep = 1;"
     text = prefix + 'payload={"token":"actual-secret","public":"ok"}' + suffix
     record = {"old_string": text}
-    assert dashboard.redact_dashboard_records([record]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([record]) == [{"old_string": "REDACTED"}]
     assert record == {"old_string": text}
 
 
@@ -210,39 +215,34 @@ def test_second_layer_reuses_original_nested_json_redactor_in_bounded_literal() 
         ("//ho\tst：443/path", None),
     ],
 )
-def test_second_layer_recognizes_standard_parser_prefix_control_cleanup(
-    prefix: str, expected_prefix: str | None
-) -> None:
+def test_failed_prefix_controls_hide_the_current_string(prefix: str, expected_prefix: str | None) -> None:
     text = prefix + "?token=actual-secret&label=public"
     record = {"old_string": text}
-    expected = "REDACTED" if expected_prefix is None else expected_prefix + "?token=REDACTED&label=public"
-    assert dashboard.redact_dashboard_records([record]) == [{"old_string": expected}]
+    assert redact_records_for_display([record]) == [{"old_string": "REDACTED"}]
     assert record == {"old_string": text}
 
 
 @pytest.mark.parametrize("prefix", ["//h：\n", "//ho\nst：443", "//ho\r\nst：443"])
 @pytest.mark.parametrize("credential", ["s", "actual-secret", "==actual-secret"])
 @pytest.mark.parametrize("quote", ["", "'", '"'])
-def test_ambiguous_multiline_network_prefix_reuses_query_without_leaking(
-    prefix: str, credential: str, quote: str
-) -> None:
+def test_failed_multiline_network_prefix_hides_the_current_string(prefix: str, credential: str, quote: str) -> None:
     uri = prefix + "?token=" + credential + "&public=keep#fragment"
     before = "// Deliverables： only\nconst uri=" if quote else ""
     after = ";\nconst keep=1;" if quote else ""
     text = before + quote + uri + quote + after
     record = {"old_string": text}
-    assert dashboard.redact_dashboard_records([record]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([record]) == [{"old_string": "REDACTED"}]
     assert record == {"old_string": text}
 
 
 @pytest.mark.parametrize("quote", ["", "'", '"'])
-def test_ambiguous_sensitive_query_that_original_rules_cannot_redact_hides_only_tail(quote: str) -> None:
+def test_failed_multiline_sensitive_query_hides_the_current_string(quote: str) -> None:
     prefix = "//ho\nst：443?"
     before = "// Deliverables： only\nconst uri=" if quote else ""
     after = ";\nconst keep=1;" if quote else ""
     text = before + quote + prefix + "public=(token==actual-secret)" + quote + after
     record = {"old_string": text}
-    assert dashboard.redact_dashboard_records([record]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([record]) == [{"old_string": "REDACTED"}]
     assert record == {"old_string": text}
 
 
@@ -253,7 +253,7 @@ def test_ambiguous_sensitive_query_that_original_rules_cannot_redact_hides_only_
 def test_uri_shaped_multiline_comment_uses_privacy_first_query_policy(expression: str, masked_query: str) -> None:
     prefix = "//note：\nready?"
     text = prefix + expression
-    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": masked_query}]
+    assert redact_records_for_display([{"old_string": text}]) == [{"old_string": masked_query}]
 
 
 @pytest.mark.parametrize(
@@ -263,10 +263,10 @@ def test_uri_shaped_multiline_comment_uses_privacy_first_query_policy(expression
         '\'https://host：443/path?payload={"token":"before\'actual-secret"}\';\nconst keep=1;',
     ],
 )
-def test_conflicting_source_quotes_do_not_count_as_safe_recovery(literal: str) -> None:
+def test_failed_source_with_conflicting_quotes_hides_the_current_string(literal: str) -> None:
     prefix = "// Deliverables： only\nconst uri = "
     record = {"old_string": prefix + literal}
-    assert dashboard.redact_dashboard_records([record]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([record]) == [{"old_string": "REDACTED"}]
     assert record == {"old_string": prefix + literal}
 
 
@@ -280,29 +280,29 @@ def test_conflicting_source_quotes_do_not_count_as_safe_recovery(literal: str) -
         r'"https:\x2f\x2fhost/path?token=actual-secret"',
     ],
 )
-def test_bounded_source_escapes_use_local_last_fallback_and_keep_following_source(literal: str) -> None:
+def test_failed_source_with_escapes_hides_the_current_string(literal: str) -> None:
     prefix = "// Deliverables： only\nconst uri = "
     suffix = ';\nconst title="public";\nconst keep=1;'
     record = {"old_string": prefix + literal + suffix}
-    assert dashboard.redact_dashboard_records([record]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([record]) == [{"old_string": "REDACTED"}]
     assert record == {"old_string": prefix + literal + suffix}
 
 
-def test_unsupported_quoted_nested_form_uses_local_last_fallback() -> None:
+def test_failed_source_with_nested_form_hides_the_current_string() -> None:
     prefix = "// Deliverables： only\nconst uri = "
     literal = "'https://host/path?payload=\"client_secret=actual-secret\"'"
     suffix = ";\nconst keep=1;"
     record = {"old_string": prefix + literal + suffix}
-    assert dashboard.redact_dashboard_records([record]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([record]) == [{"old_string": "REDACTED"}]
     assert record == {"old_string": prefix + literal + suffix}
 
 
-def test_network_authority_with_trailing_space_uses_shared_query_core() -> None:
+def test_failed_network_authority_with_trailing_space_hides_the_current_string() -> None:
     text = "//host：443 /path?token=actual-secret"
     record = {"old_string": text}
     expected = [{"old_string": "REDACTED"}]
-    assert dashboard.redact_dashboard_records([record]) == expected
-    assert dashboard.redact_dashboard_records(expected) == expected
+    assert redact_records_for_display([record]) == expected
+    assert redact_records_for_display(expected) == expected
     assert record == {"old_string": text}
 
 
@@ -318,17 +318,14 @@ def test_network_uri_variations_never_expose_query_credentials(path: str, quote:
         else:
             text = uri
         record = {"old_string": text}
-        output = dashboard.redact_dashboard_records([record])[0]["old_string"]
+        output = redact_records_for_display([record])[0]["old_string"]
         assert "actual-secret" not in output, (delimiter, path, quote, output)
         assert "REDACTED" in output
-        if quote or delimiter == "'":
-            assert output == "REDACTED"
-        else:
-            assert output == text.replace("actual-secret", "REDACTED")
+        assert output == "REDACTED"
         assert record == {"old_string": text}
 
 
-def test_failed_uri_query_combinations_preserve_public_text_and_hide_secrets() -> None:
+def test_failed_uri_query_combinations_hide_the_current_string() -> None:
     authorities = [
         "//host：443",
         "//user=name@host：443",
@@ -351,22 +348,18 @@ def test_failed_uri_query_combinations_preserve_public_text_and_hide_secrets() -
         before = "// Deliverables： only\nconst u = " + quote if quote else ""
         after = quote + ";\nconst keep = 1;" if quote else ""
         text = before + uri + after
-        output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+        output = redact_records_for_display([{"old_string": text}])[0]["old_string"]
         assert "actual-secret" not in output, (text, output)
-        if quote or authority in {"//host／part", "//host＠name", "//host＃part"}:
-            assert output == "REDACTED"
-        else:
-            assert output.startswith(authority + path + "?")
-            assert output.endswith("&public=keep")
+        assert output == "REDACTED"
         assert "REDACTED" in output
 
 
 @pytest.mark.parametrize("quote", ["'", '"', "`"])
-def test_multiple_uri_literals_are_each_processed(quote: str) -> None:
+def test_failed_source_with_multiple_uri_literals_hides_the_current_string(quote: str) -> None:
     first = "//user=name@host：443?token=first-secret"
     second = "//host：443?token=second-secret"
     text = f"// Deliverables： only\nconst a = {quote}{first}{quote}; const b = {quote}{second}{quote};"
-    output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+    output = redact_records_for_display([{"old_string": text}])[0]["old_string"]
     assert "first-secret" not in output
     assert "second-secret" not in output
     assert output == "REDACTED"
@@ -374,27 +367,27 @@ def test_multiple_uri_literals_are_each_processed(quote: str) -> None:
 
 @pytest.mark.parametrize("comment", ["// Verify： ready", "//Verify： ready", "// Verify："])
 @pytest.mark.parametrize("operator", ["===", "==", "=~", "!=", "<=", ">="])
-def test_same_line_comment_query_does_not_consume_source(comment: str, operator: str) -> None:
+def test_same_line_comment_query_hides_the_failed_string(comment: str, operator: str) -> None:
     text = f"{comment}? token {operator} expected\nconst keep = 1;"
-    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([{"old_string": text}]) == [{"old_string": "REDACTED"}]
 
 
 @pytest.mark.parametrize("quote", ["'", '"', "`"])
-def test_unclosed_network_literal_without_path_reaches_final_fallback(quote: str) -> None:
+def test_failed_source_with_unclosed_network_literal_hides_the_current_string(quote: str) -> None:
     prefix = "// Deliverables： only\nconst u = "
     text = prefix + quote + "//user=name@host：443?access_token=actual-secret;"
-    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([{"old_string": text}]) == [{"old_string": "REDACTED"}]
 
 
-def test_escaped_failed_network_authority_uses_conservative_recovery() -> None:
+def test_escaped_failed_network_authority_hides_the_current_string() -> None:
     text = r"//user\name@host：443?access_token=actual-secret"
-    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([{"old_string": text}]) == [{"old_string": "REDACTED"}]
 
 
-def test_unrecoverable_candidate_cannot_fall_through_as_safe(monkeypatch) -> None:
-    # Simulate a representation the precise query layer cannot recover.
+def test_failed_first_parse_never_enters_the_query_core(monkeypatch) -> None:
+    # A failed first parse must short-circuit before the query layer.
     def failed_query(*args, **kwargs):
-        raise ValueError("Unsupported query representation")
+        pytest.fail("Failed URL parsing must not enter query redaction")
 
     monkeypatch.setattr(dashboard, "_redact_query_string", failed_query)
     for value in (
@@ -402,9 +395,8 @@ def test_unrecoverable_candidate_cannot_fall_through_as_safe(monkeypatch) -> Non
         '// Deliverables： only\nconst u = "//host：443?access_token=actual-secret";',
         "// Deliverables： only\nconst u = `//host：443?access_token=actual-secret`;",
     ):
-        output = dashboard.redact_dashboard_records([{"old_string": value}])[0]["old_string"]
-        assert "actual-secret" not in output
-        assert "REDACTED" in output
+        output = redact_records_for_display([{"old_string": value}])[0]["old_string"]
+        assert output == "REDACTED"
 
 
 @pytest.mark.parametrize(
@@ -421,7 +413,7 @@ def test_unrecoverable_candidate_cannot_fall_through_as_safe(monkeypatch) -> Non
 )
 def test_dynamic_template_does_not_claim_a_static_literal_boundary(template: str) -> None:
     text = "// Deliverables： only\nconst u = " + template + ";"
-    output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+    output = redact_records_for_display([{"old_string": text}])[0]["old_string"]
     assert output == "REDACTED"
 
 
@@ -429,18 +421,18 @@ def test_dynamic_template_does_not_claim_a_static_literal_boundary(template: str
 @pytest.mark.parametrize(
     "uri", ["//host：443 ?token=actual-secret", "//ho st：443?token=actual-secret", " //host：443?token=actual-secret"]
 )
-def test_literal_context_recovers_network_authority_spaces(quote: str, uri: str) -> None:
+def test_failed_literal_context_with_authority_spaces_hides_the_current_string(quote: str, uri: str) -> None:
     text = "// Deliverables： only\nconst u = " + quote + uri + quote + ";\nconst keep = 1;"
-    output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+    output = redact_records_for_display([{"old_string": text}])[0]["old_string"]
     assert "actual-secret" not in output
     assert output == "REDACTED"
 
 
-def test_trailing_authority_space_without_path_does_not_bypass_recovery() -> None:
+def test_failed_trailing_authority_space_hides_the_current_string() -> None:
     uri = "//host：443 ?token=actual-secret"
     expected = [{"old_string": "REDACTED"}]
-    assert dashboard.redact_dashboard_records([{"old_string": uri}]) == expected
-    assert dashboard.redact_dashboard_records(expected) == expected
+    assert redact_records_for_display([{"old_string": uri}]) == expected
+    assert redact_records_for_display(expected) == expected
 
 
 @pytest.mark.parametrize("quote", ["'", '"', "`"])
@@ -452,36 +444,36 @@ def test_trailing_authority_space_without_path_does_not_bypass_recovery() -> Non
         r"https:\/\/host?token=actual-secret",
     ],
 )
-def test_closed_and_unclosed_literals_share_candidate_discovery(quote: str, uri: str) -> None:
+def test_failed_closed_and_unclosed_literals_hide_the_current_string(quote: str, uri: str) -> None:
     prefix = "// Deliverables： only\nconst u = "
     for closing in [quote, ""]:
         text = prefix + quote + uri + closing + ";"
-        output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+        output = redact_records_for_display([{"old_string": text}])[0]["old_string"]
         assert "actual-secret" not in output
         assert output == "REDACTED"
 
 
 @pytest.mark.parametrize("quote", ["'", '"', "`"])
-def test_dangling_escape_does_not_hide_an_unclosed_candidate(quote: str) -> None:
+def test_failed_source_with_dangling_escape_hides_the_current_string(quote: str) -> None:
     prefix = "// Deliverables： only\nconst u = "
     text = prefix + quote + r"https\u003a\u002f\u002fhost?access_token=actual-secret" + "\\"
-    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([{"old_string": text}]) == [{"old_string": "REDACTED"}]
 
 
 @pytest.mark.parametrize("quote", ["'", '"', "`"])
 @pytest.mark.parametrize("comment", ["// Don't： change", '// Say "hello：', "// Use `literal："])
-def test_rejected_comment_quotes_cannot_consume_later_uri_literals(quote: str, comment: str) -> None:
+def test_failed_comment_quotes_hide_the_current_string(quote: str, comment: str) -> None:
     text = comment + "\nconst u = " + quote + "/path?token=actual-secret" + quote + ";\nconst keep = 1;"
-    output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+    output = redact_records_for_display([{"old_string": text}])[0]["old_string"]
     assert "actual-secret" not in output
     assert output == "REDACTED"
 
 
 @pytest.mark.parametrize("template", ['`${ready ? "ready" : "waiting"}`', "`Hello ${name}`"])
-def test_exceptional_templates_are_uncertain_without_sensitive_query_hints(template: str) -> None:
+def test_exceptional_templates_keep_the_original_question_mark_gate(template: str) -> None:
     text = "// Deliverables： only\nconst message = " + template + ";\nconst keep = 1;"
     expected = "REDACTED" if "?" in template else text
-    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": expected}]
+    assert redact_records_for_display([{"old_string": text}]) == [{"old_string": expected}]
     normal = text.removeprefix("// Deliverables： only\n")
     assert dashboard.redact_dashboard_records([{"old_string": normal}]) == [{"old_string": normal}]
 
@@ -489,25 +481,25 @@ def test_exceptional_templates_are_uncertain_without_sensitive_query_hints(templ
 @pytest.mark.parametrize(
     "template", ["`Hello ${name}`", '`${ready ? "ready" : "waiting"}`', '`Hello ${{name: "}"}.name}`']
 )
-def test_interpolation_masks_unproved_later_source_during_recovery(template: str) -> None:
+def test_failed_interpolation_hides_the_current_string(template: str) -> None:
     text = (
         "// Deliverables： only\nconst label = " + template + ";\nconst result = ready ? token === expected : fallback;"
     )
-    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([{"old_string": text}]) == [{"old_string": "REDACTED"}]
 
 
 @pytest.mark.parametrize("expression", ['"#".slice(1)', 'opts["#"]', "getBase(`host#fragment`)"])
-def test_dynamic_expression_fragment_cannot_hide_later_query_credentials(expression: str) -> None:
+def test_failed_dynamic_expression_fragment_hides_the_current_string(expression: str) -> None:
     prefix = "// Deliverables： only\nconst u = "
     text = prefix + "`https://host/path?public=${" + expression + "}&token=actual-secret`;\nconst keep = 1;"
-    output = dashboard.redact_dashboard_records([{"old_string": text}])[0]["old_string"]
+    output = redact_records_for_display([{"old_string": text}])[0]["old_string"]
     assert "actual-secret" not in output
     assert output == "REDACTED"
 
 
-def test_unparsed_regex_in_template_cannot_establish_a_false_boundary() -> None:
+def test_failed_source_with_regex_template_hides_the_current_string() -> None:
     text = "// Deliverables： only\nconst u = `${/}/.test(x) ? `host` : base}/path?token=actual-secret`;"
-    assert dashboard.redact_dashboard_records([{"old_string": text}]) == [{"old_string": "REDACTED"}]
+    assert redact_records_for_display([{"old_string": text}]) == [{"old_string": "REDACTED"}]
 
 
 @pytest.mark.parametrize(
@@ -516,7 +508,7 @@ def test_unparsed_regex_in_template_cannot_establish_a_false_boundary() -> None:
         (
             "//user=name@host：443?access_token=actual-secret",
             "actual-secret",
-            "//user=name@host：443?access_token=REDACTED",
+            "REDACTED",
         ),
         (
             "// Deliverables： only\nconst u = `//host：443/path?access_token=actual-secret`;",
@@ -528,12 +520,12 @@ def test_unparsed_regex_in_template_cannot_establish_a_false_boundary() -> None:
         (
             "https://host：443/path?token=actual-secret&label=public",
             "actual-secret",
-            "https://host：443/path?token=REDACTED&label=public",
+            "REDACTED",
         ),
         (
             "https://host：443/path?payload=client_secret%3Dactual-secret",
             "actual-secret",
-            "https://host：443/path?payload=client_secret%3DREDACTED",
+            "REDACTED",
         ),
         (
             '// Deliverables： only\nconst uri="https://host：443/path?token=actual-secret&label=public";',
@@ -541,7 +533,7 @@ def test_unparsed_regex_in_template_cannot_establish_a_false_boundary() -> None:
             "REDACTED",
         ),
         ("https\n://host：443/path?token=actual-secret", "actual-secret", "REDACTED"),
-        ("\x00//host：443/path?token=actual-secret", "actual-secret", "//host：443/path?token=REDACTED"),
+        ("\x00//host：443/path?token=actual-secret", "actual-secret", "REDACTED"),
         (
             '// Deliverables： only\nconst uri="https://host：443/path?access_\r\ntoken=actual-secret";\nconst keep=1;',
             "actual-secret",
@@ -591,6 +583,7 @@ async def test_original_failed_records_and_html_views_preserve_raw_capture(
     store.append_record(session_id, record)
     conn = store._connect()
     raw_payload = conn.execute("SELECT payload_json FROM records WHERE session_id=?", (session_id,)).fetchone()[0]
+    cached_summary = conn.execute("SELECT summary_json FROM sessions WHERE id=?", (session_id,)).fetchone()[0]
     server = LiveViewerServer(host="127.0.0.1", port=0)
     port = await server.start()
     base_url = f"http://127.0.0.1:{port}"
@@ -602,10 +595,13 @@ async def test_original_failed_records_and_html_views_preserve_raw_capture(
                 actual_text = payload["records"][0]["request"]["body"]["messages"][1]["content"][0]["input"][
                     "old_string"
                 ]
-                if expected_text is None:
-                    expected_text = text.replace("actual-secret", "REDACTED")
                 assert actual_text == expected_text
                 assert payload["records"][0]["request"]["body"]["system"] == expected_text
+                assert payload["session"]["first_user"] == "REDACTED"
+                assert payload["session"]["last_response"] == "REDACTED"
+                assert payload["session"]["error"] == ""
+                assert payload["records"][0]["request"]["body"]["messages"][0]["content"] == "Apply the captured Edit."
+                assert payload["records"][0]["response"]["body"]["content"][0]["text"] == "Edit applied."
                 if secret:
                     assert secret not in json.dumps(payload)
                 else:
@@ -615,9 +611,16 @@ async def test_original_failed_records_and_html_views_preserve_raw_capture(
                 html = await response.text()
                 if secret:
                     assert secret not in html
+                metadata_json = html.partition("const EMBEDDED_TRACE_META = ")[2]
+                metadata, _ = json.JSONDecoder().raw_decode(metadata_json)
+                assert len(metadata) == 1
+                assert metadata[0]["session_user_text"] == "REDACTED"
+                assert metadata[0]["sys_hint"] == "REDACTED"
+                assert metadata[0]["error_message"] == ""
     finally:
         await server.stop()
     assert store.load_records(session_id) == [record]
     assert (
         conn.execute("SELECT payload_json FROM records WHERE session_id=?", (session_id,)).fetchone()[0] == raw_payload
     )
+    assert conn.execute("SELECT summary_json FROM sessions WHERE id=?", (session_id,)).fetchone()[0] == cached_summary

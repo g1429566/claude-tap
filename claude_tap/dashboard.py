@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-import unicodedata
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -61,9 +62,25 @@ _SENSITIVE_KEY_NAMES = {
 }
 _FORM_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-\[\]]{1,128}$")
 _MAX_TEXT_REDACTION_DEPTH = 8
-_FAILED_URI_AUTHORITY_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*:)?//")
-_URL_LEADING_CONTROLS = "".join(map(chr, range(33)))
-_REDACTION_AUTHORITY = "redaction.invalid"
+_dashboard_url_failures: ContextVar[list[bool] | None] = ContextVar("dashboard_url_failures", default=None)
+
+
+@contextmanager
+def dashboard_redaction_scope():
+    """Keep URL recovery local to one displayed session or metadata response."""
+    failures: list[bool] = []
+    token = _dashboard_url_failures.set(failures)
+    try:
+        yield failures
+    finally:
+        _dashboard_url_failures.reset(token)
+
+
+def hide_dashboard_previews(summary: dict[str, Any], fields=("first_user", "last_response", "error")) -> None:
+    """Hide response previews when their full source cannot be identified safely."""
+    for field in fields:
+        if summary.get(field):
+            summary[field] = _REDACTED_VALUE
 
 
 def read_dashboard_template() -> str:
@@ -114,14 +131,17 @@ def list_trace_sessions(
 
     sessions: list[dict[str, Any]] = []
     for row in rows:
-        try:
-            summary = _session_summary_from_row(
-                store,
-                row,
-                repair_stale_summary=repair_stale_summaries,
-            )
-        except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError):
-            summary = _minimal_session_summary_from_row(row)
+        with dashboard_redaction_scope() as failures:
+            try:
+                summary = _session_summary_from_row(
+                    store,
+                    row,
+                    repair_stale_summary=repair_stale_summaries,
+                )
+            except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError):
+                summary = _minimal_session_summary_from_row(row)
+            if failures:
+                hide_dashboard_previews(summary)
         sessions.append(
             _apply_current_session_state(
                 summary,
@@ -203,17 +223,20 @@ def load_trace_session(
     row = store.load_session_row(session_id)
     if row is None:
         return None
-    summary = _apply_current_session_state(
-        _session_summary_from_row(store, row, allow_record_scan=False),
-        current_session_id,
-        live_record_count=(
-            live_record_count
-            if live_record_count is not None and current_session_id and row["id"] == current_session_id
-            else None
-        ),
-    )
-    summary = redact_dashboard_summary(summary)
-    records = redact_dashboard_records(store.load_records(session_id, limit=record_limit, offset=record_offset))
+    with dashboard_redaction_scope() as failures:
+        summary = _apply_current_session_state(
+            _session_summary_from_row(store, row, allow_record_scan=False),
+            current_session_id,
+            live_record_count=(
+                live_record_count
+                if live_record_count is not None and current_session_id and row["id"] == current_session_id
+                else None
+            ),
+        )
+        summary = redact_dashboard_summary(summary)
+        records = redact_dashboard_records(store.load_records(session_id, limit=record_limit, offset=record_offset))
+        if failures:
+            hide_dashboard_previews(summary)
     return {"session": summary, "records": records}
 
 
@@ -377,6 +400,8 @@ def _session_summary_from_row(
     allow_record_scan: bool = False,
     repair_stale_summary: bool = True,
 ) -> dict[str, Any]:
+    failures = _dashboard_url_failures.get()
+    failure_count = len(failures) if failures is not None else 0
     summary_json = row["summary_json"]
     if summary_json:
         try:
@@ -393,7 +418,8 @@ def _session_summary_from_row(
                 boundary_records = store.load_boundary_records(row["id"])
                 if boundary_records:
                     summary = _summary_from_boundary_records(row, boundary_records, cached)
-                    store.store_summary(row["id"], summary)
+                    if failures is None or len(failures) == failure_count:
+                        store.store_summary(row["id"], summary)
                     return summary
             return _normalize_cached_session_summary(row, cached)
 
@@ -417,7 +443,8 @@ def _session_summary_from_row(
         )
         summary["active"] = row["status"] == "active"
         if row["status"] != "active":
-            store.store_summary(row["id"], summary)
+            if failures is None or len(failures) == failure_count:
+                store.store_summary(row["id"], summary)
         return redact_dashboard_summary(summary)
 
     if not allow_record_scan:
@@ -436,7 +463,8 @@ def _session_summary_from_row(
                     is_current=False,
                     record_count=record_count,
                 )
-                store.store_summary(row["id"], summary)
+                if failures is None or len(failures) == failure_count:
+                    store.store_summary(row["id"], summary)
                 return summary
         return _minimal_session_summary_from_row(row)
 
@@ -455,7 +483,8 @@ def _session_summary_from_row(
     )
     summary["active"] = row["status"] == "active"
     if row["status"] != "active":
-        store.store_summary(row["id"], summary)
+        if failures is None or len(failures) == failure_count:
+            store.store_summary(row["id"], summary)
     return redact_dashboard_summary(summary)
 
 
@@ -962,52 +991,17 @@ def _redact_url_query(value: str, depth: int = 0) -> str | None:
     try:
         parsed = urlsplit(value)
     except ValueError:
-        return _redact_failed_url_text(value, depth)
+        failures = _dashboard_url_failures.get()
+        if failures is None:
+            raise
+        failures.append(True)
+        return _REDACTED_VALUE
     if not parsed.query or not _looks_like_url_or_path(value, parsed.path):
         return None
     redacted_query = _redact_query_string(parsed.query, depth)
     if redacted_query is None:
         return None
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, redacted_query, parsed.fragment))
-
-
-def _redact_failed_url_text(value: str, depth: int) -> str:
-    """Repair a simple URI authority, or hide the uncertain failed field."""
-    raw = value.lstrip(_URL_LEADING_CONTROLS)
-    before_fragment, _, fragment = raw.partition("#")
-    prefix = before_fragment.partition("?")[0]
-    # Check raw source boundaries before control cleanup could join lines.
-    if (
-        any(char.isspace() for char in prefix + fragment)
-        or any(char in prefix + fragment for char in "\\\"'`{}<>")
-        or "?" in fragment
-    ):
-        return _REDACTED_VALUE
-    view = raw.replace("\t", "").replace("\r", "").replace("\n", "")
-    opening = _FAILED_URI_AUTHORITY_RE.match(view)
-    if opening is None:
-        return _REDACTED_VALUE
-    start = opening.end()
-    end = min((i for char in "/?#" if (i := view.find(char, start)) >= 0), default=len(view))
-    authority = view[start:end]
-    # Recovery only owns a whole, bounded URI. Source-like prefixes never
-    # enter another discovery/parser path after authority parsing has failed.
-    if not authority:
-        return _REDACTED_VALUE
-    normalized = unicodedata.normalize("NFKC", authority)
-    if any(char in normalized for char in "/?#") or normalized.count("@") != authority.count("@"):
-        return _REDACTED_VALUE
-    repaired = view[:start] + _REDACTION_AUTHORITY + view[end:]
-    try:
-        parsed = urlsplit(repaired)
-        redacted_query = _redact_query_string(parsed.query, depth)
-    except (ValueError, RecursionError):
-        return _REDACTED_VALUE
-    if redacted_query is None:
-        return value
-    # Restore only the authority component. Neither an old query nor another
-    # occurrence of the placeholder can be substituted back into the output.
-    return urlunsplit((parsed.scheme, authority, parsed.path, redacted_query, parsed.fragment))
 
 
 def _redact_form_text(value: str, depth: int = 0) -> str | None:

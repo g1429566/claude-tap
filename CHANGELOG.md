@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Fix session records and HTML viewer HTTP 500 errors caused by URL authority parsing of captured text.
+- Fix Dashboard records and HTML viewer HTTP 500 errors caused by `urlsplit()` `ValueError`, hiding the affected display strings and response text previews while retaining stored captures.
 
 - Ignore object key order in viewer parameter diffs and sort displayed JSON to highlight actual value changes.
 

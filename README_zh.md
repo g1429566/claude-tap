@@ -605,7 +605,7 @@ claude-tap --tap-no-launch --tap-port 8080
 claude-tap --tap-no-open
 ```
 
-URL 解析失败时，Dashboard 可能将受影响的字段显示为 `REDACTED`。JSONL、compact 和 HTML 下载保留已存储的采集记录，包括记录前已执行的认证 header 脱敏。
+Dashboard 渲染会话时，若 `urlsplit()` 抛出 `ValueError`，受影响的字符串和该响应的文本预览将显示为 `REDACTED`。原有内容识别与嵌套深度限制仍适用。JSONL、compact 和 HTML 下载保留已存储的采集记录，包括记录前已执行的认证 header 脱敏。
 
 纯代理模式下，可以在另一个终端启动客户端，并把它的 base URL 或代理配置指向本地代理。具体接法见 [客户端支持矩阵](docs/support-matrix.md)。
 
