@@ -33,13 +33,13 @@ boundaries, records/HTML responses, masking, and unchanged stored and export dat
 Current screenshots use local headless Chromium on macOS at 1280x900 CSS pixels
 and 2x scale. Both viewer pages and records endpoints return HTTP 200.
 
+- `trace-viewer-multiturn-baseline-network.png`: native Chromium Network Headers
+  show the records GET returning HTTP 500, documenting the original failure.
 - `trace-viewer-query-redacted-demo.png`: demonstration fixture, with no model
   call. Only the fake token is hidden; the public parameter and URL structure remain.
 - `trace-viewer-source-redacted-current.png`: the original real two-user-turn
   Claude Code session, captured through the local proxy using tmux with DeepSeek
   `deepseek-flash`. Edit fields show `REDACTED`; the filename and session remain visible.
-- `trace-viewer-multiturn-baseline-network.png`: native Chromium Network Headers
-  show the records GET returning HTTP 500, documenting the original failure.
 
 The original `trace-viewer-multiturn-fixed.png` is retained as a historical
 capture of complete Edit source, not current masking evidence.
